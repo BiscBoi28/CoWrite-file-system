@@ -150,6 +150,7 @@ static struct storage_server *select_storage_server_with_ticket(struct nm_contex
                                                                 const char *op,
                                                                 int *server_index_out,
                                                                 char *token_out);
+static int handle_server_message(struct nm_context *ctx, const char *json);
 
 static void update_max_fd(struct nm_context *ctx) {
     ctx->max_fd = ctx->listen_fd;
@@ -175,14 +176,60 @@ static void ticket_prune(struct nm_context *ctx) {
     }
 }
 
-static int forward_command(struct storage_server *ss, const char *payload, char **response_out) {
+static int forward_command(struct nm_context *ctx,
+                           struct storage_server *ss,
+                           const char *payload,
+                           char **response_out) {
     if (net_send_json(ss->ctrl_fd, payload) < 0) {
         return -1;
     }
-    if (net_recv_json(ss->ctrl_fd, response_out) < 0) {
-        return -1;
+    char *command_resp = NULL;
+    char **pending = NULL;
+    size_t pending_count = 0;
+    while (1) {
+        char *json = NULL;
+        if (net_recv_json(ss->ctrl_fd, &json) < 0) {
+            free(json);
+            goto error;
+        }
+        char type[64];
+        if (json_get_string(json, "type", type, sizeof(type)) == 0) {
+            char **tmp = realloc(pending, (pending_count + 1) * sizeof(*pending));
+            if (!tmp) {
+                free(json);
+                goto error;
+            }
+            pending = tmp;
+            pending[pending_count++] = json;
+            continue;
+        }
+        command_resp = json;
+        break;
+    }
+    for (size_t i = 0; i < pending_count; ++i) {
+        if (handle_server_message(ctx, pending[i]) < 0) {
+            free(pending[i]);
+            goto error;
+        }
+        free(pending[i]);
+    }
+    free(pending);
+    if (response_out) {
+        *response_out = command_resp;
+    } else {
+        free(command_resp);
     }
     return 0;
+
+error:
+    if (pending) {
+        for (size_t i = 0; i < pending_count; ++i) {
+            free(pending[i]);
+        }
+        free(pending);
+    }
+    free(command_resp);
+    return -1;
 }
 
 static int issue_ticket(struct nm_context *ctx,
@@ -213,7 +260,7 @@ static int issue_ticket(struct nm_context *ctx,
     }
 
     char *response = NULL;
-    if (forward_command(ss, payload, &response) < 0) {
+    if (forward_command(ctx, ss, payload, &response) < 0) {
         free(response);
         return -1;
     }
@@ -603,7 +650,7 @@ static int handle_client_create(struct nm_context *ctx, struct peer *p, const ch
         return send_error_response(p->fd, ERR_INTERNAL, "payload too large");
     }
     char *response = NULL;
-    if (forward_command(ss, payload, &response) < 0) {
+    if (forward_command(ctx, ss, payload, &response) < 0) {
         free(response);
         nm_mark_server_down(&ctx->state, ss_index);
         return send_error_response(p->fd, ERR_UNAVAILABLE, "server unreachable");
@@ -621,7 +668,7 @@ static int handle_client_create(struct nm_context *ctx, struct peer *p, const ch
         struct storage_server *backup = nm_get_server(&ctx->state, backup_index);
         char *backup_resp = NULL;
         if (!backup || backup->ctrl_fd < 0 ||
-            forward_command(backup, payload, &backup_resp) < 0 ||
+            forward_command(ctx, backup, payload, &backup_resp) < 0 ||
             parse_status(backup_resp, status, sizeof(status), NULL, 0) < 0 ||
             strcmp(status, "OK") != 0) {
             log_event(ctx, "BACKUP create failed file=%s server=%d", file_name, backup_index);
@@ -663,7 +710,7 @@ static int handle_client_delete(struct nm_context *ctx, struct peer *p, const ch
         return send_error_response(p->fd, ERR_INTERNAL, "payload too large");
     }
     char *response = NULL;
-    if (forward_command(ss, payload, &response) < 0) {
+    if (forward_command(ctx, ss, payload, &response) < 0) {
         free(response);
         nm_mark_server_down(&ctx->state, ss_index);
         return send_error_response(p->fd, ERR_UNAVAILABLE, "server unreachable");
@@ -681,7 +728,7 @@ static int handle_client_delete(struct nm_context *ctx, struct peer *p, const ch
         struct storage_server *backup = nm_get_server(&ctx->state, backup_index);
         if (backup && backup->ctrl_fd >= 0) {
             char *backup_resp = NULL;
-            if (forward_command(backup, payload, &backup_resp) < 0) {
+            if (forward_command(ctx, backup, payload, &backup_resp) < 0) {
                 log_event(ctx, "BACKUP delete failed file=%s server=%d", file_name, backup_index);
             }
             free(backup_resp);
@@ -908,7 +955,7 @@ static int handle_client_undo(struct nm_context *ctx, struct peer *p, const char
         return send_error_response(p->fd, ERR_INTERNAL, "payload too large");
     }
     char *response = NULL;
-    if (forward_command(ss, payload, &response) < 0) {
+    if (forward_command(ctx, ss, payload, &response) < 0) {
         free(response);
         nm_mark_server_down(&ctx->state, ss_index);
         return send_error_response(p->fd, ERR_UNAVAILABLE, "server unreachable");
@@ -1072,7 +1119,7 @@ static void replicate_file_to_backup(struct nm_context *ctx, struct file_entry *
     }
 
     char *response = NULL;
-    if (forward_command(backup, payload, &response) < 0) {
+    if (forward_command(ctx, backup, payload, &response) < 0) {
         log_event(ctx, "BACKUP sync command failed file=%s server=%d", file->name, file->backup_index);
     } else {
         char status[16];

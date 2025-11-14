@@ -27,6 +27,21 @@ static void trim_newline(char *s) {
     }
 }
 
+static char *trim_spaces(char *s) {
+    if (!s) {
+        return NULL;
+    }
+    while (*s && isspace((unsigned char)*s)) {
+        s++;
+    }
+    char *end = s + strlen(s);
+    while (end > s && isspace((unsigned char)end[-1])) {
+        end--;
+    }
+    *end = '\0';
+    return s;
+}
+
 static int socket_local_ip(int fd, char *buf, size_t buf_size) {
     struct sockaddr_storage addr;
     socklen_t len = sizeof(addr);
@@ -886,7 +901,8 @@ static void print_help(void) {
     printf("  WRITE <file> [sentence]\n");
     printf("    After WRITE, enter '<word_index> <content>' lines and finish with ETIRW.\n");
     printf("  STREAM <file>\n");
-    printf("  ADDACCESS <file> <user> [rw]\n");
+    printf("  ADDACCESS -R|-W <file> <user>\n");
+    printf("    legacy: ADDACCESS <file> <user> [rw]\n");
     printf("  REMACCESS <file> <user>\n");
     printf("  UNDO <file>\n");
     printf("  EXEC <file>\n");
@@ -1094,23 +1110,43 @@ int main(int argc, char **argv) {
             continue;
         }
         if (strcmp(cmd, "ADDACCESS") == 0) {
-            char *file = strtok_r(NULL, " ", &save);
-            char *user = strtok_r(NULL, " ", &save);
-            char *mode = strtok_r(NULL, "", &save);
-            if (!file || !user) {
-                printf("usage: ADDACCESS <file> <user> [rw]\n");
+            char *arg1 = strtok_r(NULL, " ", &save);
+            char *arg2 = strtok_r(NULL, " ", &save);
+            char *arg3 = strtok_r(NULL, "", &save);
+            if (!arg1 || !arg2) {
+                printf("usage: ADDACCESS [-R|-W] <file> <user>\n");
                 continue;
             }
             int write_perm = 0;
-            if (mode) {
-                while (*mode && isspace((unsigned char)*mode)) mode++;
-                if (*mode == 'r' || *mode == 'R') {
-                    if (strchr(mode, 'w') || strchr(mode, 'W')) {
+            char *file = NULL;
+            char *user = NULL;
+            if (arg1[0] == '-' && arg1[1] != '\0' && arg1[2] == '\0' &&
+                (arg1[1] == 'R' || arg1[1] == 'r' || arg1[1] == 'W' || arg1[1] == 'w')) {
+                write_perm = (arg1[1] == 'W' || arg1[1] == 'w');
+                file = arg2;
+                user = trim_spaces(arg3);
+            } else {
+                file = arg1;
+                user = arg2;
+                char *mode = trim_spaces(arg3);
+                if (mode && *mode) {
+                    if (*mode == 'r' || *mode == 'R') {
+                        if (strchr(mode, 'w') || strchr(mode, 'W')) {
+                            write_perm = 1;
+                        }
+                    } else if (*mode == 'w' || *mode == 'W') {
                         write_perm = 1;
                     }
-                } else if (*mode == 'w' || *mode == 'W') {
-                    write_perm = 1;
                 }
+            }
+            if (!file || !user) {
+                printf("usage: ADDACCESS [-R|-W] <file> <user>\n");
+                continue;
+            }
+            user = trim_spaces(user);
+            if (!user || !*user) {
+                printf("usage: ADDACCESS [-R|-W] <file> <user>\n");
+                continue;
             }
             handle_addaccess_cmd(nm_fd, file, user, write_perm);
             continue;
