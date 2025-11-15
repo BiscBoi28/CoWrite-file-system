@@ -4,3 +4,8 @@ DESIGN_DOC.md
 examples.txt
 problem_statement.txt
 tests/
+nm_requests.log
+nm_state.db
+nm.log
+*.o
+bin/
