@@ -15,9 +15,11 @@
 
 #include "common/json_util.h"
 #include "common/net_proto.h"
+#include "cli_input.h"
 
 #define INPUT_BUF 512
 #define MAX_JSON 4096
+#define IST_OFFSET_SECONDS (5 * 3600 + 30 * 60)
 
 static char g_username[64];
 
@@ -193,12 +195,12 @@ static void format_timestamp(int raw_value, char *buf, size_t buf_len) {
         snprintf(buf, buf_len, "unknown");
         return;
     }
-    time_t ts = (time_t)raw_value;
+    time_t ts = (time_t)raw_value + IST_OFFSET_SECONDS;
     struct tm tm_buf;
 #if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 1
-    struct tm *tm_info = localtime_r(&ts, &tm_buf);
+    struct tm *tm_info = gmtime_r(&ts, &tm_buf);
 #else
-    struct tm *tm_tmp = localtime(&ts);
+    struct tm *tm_tmp = gmtime(&ts);
     struct tm *tm_info = tm_tmp ? memcpy(&tm_buf, tm_tmp, sizeof(struct tm)) : NULL;
 #endif
     if (!tm_info || strftime(buf, buf_len, "%d-%m-%y %H-%M-%S", tm_info) == 0) {
@@ -672,7 +674,7 @@ static int handle_create_cmd(int nm_fd, const char *file) {
         free(response);
         return -1;
     }
-    printf("Created %s.\n", file);
+    printf("Created %s\n", file);
     free(response);
     return 0;
 }
@@ -1015,10 +1017,10 @@ int main(int argc, char **argv) {
 
     char input[INPUT_BUF];
     char *save = NULL;
+    cli_input_init();
     while (1) {
-        printf("docs> ");
-        fflush(stdout);
-        if (!fgets(input, sizeof(input), stdin)) {
+        int read_rc = cli_input_readline("docs> ", input, sizeof(input));
+        if (read_rc <= 0) {
             printf("\n");
             break;
         }
@@ -1026,6 +1028,7 @@ int main(int argc, char **argv) {
         if (input[0] == '\0') {
             continue;
         }
+        cli_input_remember(input);
         save = NULL;
         char *cmd = strtok_r(input, " ", &save);
         if (!cmd) {

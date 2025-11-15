@@ -7,12 +7,15 @@
 #include <string.h>
 #include <time.h>
 
+#define IST_OFFSET_SECONDS (5 * 3600 + 30 * 60)
+
 static void iso_timestamp(char *buf, size_t buf_size) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     struct tm tm;
-    gmtime_r(&ts.tv_sec, &tm);
-    snprintf(buf, buf_size, "%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
+    time_t adjusted = ts.tv_sec + IST_OFFSET_SECONDS;
+    gmtime_r(&adjusted, &tm);
+    snprintf(buf, buf_size, "%04d-%02d-%02dT%02d:%02d:%02d.%03ld+05:30",
              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
              tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000);
 }

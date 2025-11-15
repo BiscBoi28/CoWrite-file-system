@@ -11,7 +11,7 @@ NM_OBJS := $(NM_SRCS:.c=.o)
 SS_SRCS := ss/ss_main.c ss/ss_state.c
 SS_OBJS := $(SS_SRCS:.c=.o)
 
-CLI_SRCS := client/cli_main.c
+CLI_SRCS := client/cli_main.c client/cli_input.c
 CLI_OBJS := $(CLI_SRCS:.c=.o)
 
 BIN_DIR := bin

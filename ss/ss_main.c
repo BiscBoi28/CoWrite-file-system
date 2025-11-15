@@ -612,8 +612,13 @@ static int handle_write(struct ss_context *ctx,
     struct write_session session;
     write_session_init(&session);
     if (write_session_begin(&session, file, user, sentence_index) < 0) {
+        int begin_err = errno;
+        write_session_clear(&session);
         file->lock_active = 0;
         file->lock_sentence = -1;
+        if (begin_err == EINVAL) {
+            return send_error_response(client_fd, ERR_BADREQ, "sentence index out of range");
+        }
         return send_error_response(client_fd, ERR_INTERNAL, "write init failed");
     }
 
@@ -666,7 +671,12 @@ static int handle_write(struct ss_context *ctx,
                 if (json_get_string_alloc(json, "content", &content) < 0) {
                     send_error_response(client_fd, ERR_BADREQ, "missing content");
                 } else if (write_session_apply_insert(&session, index, content) < 0) {
-                    send_error_response(client_fd, ERR_CONFLICT, "insert failed");
+                    int op_err = errno;
+                    if (op_err == EINVAL) {
+                        send_error_response(client_fd, ERR_BADREQ, "word index out of range");
+                    } else {
+                        send_error_response(client_fd, ERR_CONFLICT, "insert failed");
+                    }
                 } else {
                     send_ok(client_fd, "\"step\":\"INSERT\"");
                 }
@@ -681,7 +691,12 @@ static int handle_write(struct ss_context *ctx,
                 if (json_get_string_alloc(json, "content", &content) < 0) {
                     send_error_response(client_fd, ERR_BADREQ, "missing content");
                 } else if (write_session_apply_replace(&session, index, content) < 0) {
-                    send_error_response(client_fd, ERR_CONFLICT, "replace failed");
+                    int op_err = errno;
+                    if (op_err == EINVAL) {
+                        send_error_response(client_fd, ERR_BADREQ, "word index out of range");
+                    } else {
+                        send_error_response(client_fd, ERR_CONFLICT, "replace failed");
+                    }
                 } else {
                     send_ok(client_fd, "\"step\":\"REPLACE\"");
                 }
@@ -692,7 +707,12 @@ static int handle_write(struct ss_context *ctx,
             if (json_get_int(json, "index", &index) < 0) {
                 send_error_response(client_fd, ERR_BADREQ, "missing index");
             } else if (write_session_apply_delete(&session, index) < 0) {
-                send_error_response(client_fd, ERR_CONFLICT, "delete failed");
+                int op_err = errno;
+                if (op_err == EINVAL) {
+                    send_error_response(client_fd, ERR_BADREQ, "word index out of range");
+                } else {
+                    send_error_response(client_fd, ERR_CONFLICT, "delete failed");
+                }
             } else {
                 send_ok(client_fd, "\"step\":\"DELETE\"");
             }
@@ -718,6 +738,7 @@ static int handle_write(struct ss_context *ctx,
                 }
                 log_request(ctx, "WRITE_COMMIT user=%s file=%s words=%zu chars=%zu",
                             user, file->name, file->word_count, file->char_count);
+                notify_nm_file_update(ctx, file);
                 free(final_text);
             }
             write_session_clear(&session);
