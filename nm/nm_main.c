@@ -151,6 +151,9 @@ static struct storage_server *select_storage_server_with_ticket(struct nm_contex
                                                                 int *server_index_out,
                                                                 char *token_out);
 static int handle_server_message(struct nm_context *ctx, const char *json);
+static int server_is_available(struct storage_server *ss);
+static void drop_file_backup(struct nm_context *ctx, struct file_entry *file, const char *reason);
+static void try_assign_backup(struct nm_context *ctx, struct file_entry *file);
 
 static void update_max_fd(struct nm_context *ctx) {
     ctx->max_fd = ctx->listen_fd;
@@ -773,6 +776,19 @@ static int respond_with_endpoint(struct peer *p,
     return send_ok(p->fd, extra);
 }
 
+static int server_is_available(struct storage_server *ss) {
+    return ss && ss->ctrl_fd >= 0 && ss->online;
+}
+
+static void drop_file_backup(struct nm_context *ctx, struct file_entry *file, const char *reason) {
+    if (!file || file->backup_index < 0) {
+        return;
+    }
+    log_event(ctx, "dropping backup for file=%s (%s)", file->name, reason ? reason : "reason unknown");
+    file->backup_index = -1;
+    nm_state_save(&ctx->state);
+}
+
 static struct storage_server *select_storage_server(struct nm_context *ctx,
                                                    struct file_entry *file,
                                                    int *server_index_out) {
@@ -781,25 +797,28 @@ static struct storage_server *select_storage_server(struct nm_context *ctx,
     }
     if (file->ss_index >= 0) {
         struct storage_server *ss = nm_get_server(&ctx->state, file->ss_index);
-        if (ss && ss->ctrl_fd >= 0 && ss->online) {
+        if (server_is_available(ss)) {
             if (server_index_out) {
                 *server_index_out = file->ss_index;
             }
             return ss;
+        } else if (ss && !ss->online) {
+            log_event(ctx, "primary offline for file=%s server=%s", file->name, ss->id);
         }
     }
     if (file->backup_index >= 0) {
         struct storage_server *backup = nm_get_server(&ctx->state, file->backup_index);
-        if (backup && backup->ctrl_fd >= 0 && backup->online) {
-            int prev = file->ss_index;
+        if (server_is_available(backup)) {
             file->ss_index = file->backup_index;
-            file->backup_index = prev;
+            file->backup_index = -1;
             nm_state_save(&ctx->state);
             log_event(ctx, "failover file=%s server=%s", file->name, backup->id);
             if (server_index_out) {
                 *server_index_out = file->ss_index;
             }
             return backup;
+        } else {
+            drop_file_backup(ctx, file, "backup offline during selection");
         }
     }
     return NULL;
@@ -1070,29 +1089,31 @@ static int handle_client_message(struct nm_context *ctx, struct peer *p, const c
     return send_error_response(p->fd, ERR_BADREQ, "unsupported type");
 }
 
-static void replicate_file_to_backup(struct nm_context *ctx, struct file_entry *file) {
+static int replicate_file_to_backup(struct nm_context *ctx, struct file_entry *file) {
     if (!file || file->backup_index < 0 || file->ss_index < 0 || file->backup_index == file->ss_index) {
-        return;
+        return -1;
     }
     struct storage_server *primary = nm_get_server(&ctx->state, file->ss_index);
     struct storage_server *backup = nm_get_server(&ctx->state, file->backup_index);
-    if (!primary || !backup) {
-        return;
+    if (!server_is_available(primary)) {
+        log_event(ctx, "BACKUP sync skipped, primary unavailable file=%s", file->name);
+        return -1;
     }
-    if (primary->ctrl_fd < 0 || !primary->online || backup->ctrl_fd < 0 || !backup->online) {
-        return;
+    if (!server_is_available(backup)) {
+        drop_file_backup(ctx, file, "backup unavailable before sync");
+        return -1;
     }
 
     char ticket[64];
     if (issue_ticket(ctx, primary, file->ss_index, file->name, file->owner, "READ", ticket) < 0) {
         log_event(ctx, "BACKUP sync ticket failed file=%s", file->name);
-        return;
+        return -1;
     }
 
     char *content = NULL;
     if (ss_fetch_content(primary, file->name, file->owner, ticket, &content) < 0) {
         log_event(ctx, "BACKUP fetch failed file=%s", file->name);
-        return;
+        return -1;
     }
 
     char file_esc[NM_MAX_NAME * 2];
@@ -1106,7 +1127,7 @@ static void replicate_file_to_backup(struct nm_context *ctx, struct file_entry *
         json_escape_string(port_esc, sizeof(port_esc), primary->data_port) < 0 ||
         json_escape_string(ticket_esc, sizeof(ticket_esc), ticket) < 0) {
         free(content);
-        return;
+        return -1;
     }
 
     char payload[MAX_JSON];
@@ -1115,24 +1136,55 @@ static void replicate_file_to_backup(struct nm_context *ctx, struct file_entry *
                  "\"sourceHost\":\"%s\",\"sourcePort\":\"%s\",\"ticket\":\"%s\"}",
                  file_esc, owner_esc, host_esc, port_esc, ticket_esc) >= (int)sizeof(payload)) {
         free(content);
-        return;
+        return -1;
     }
 
     char *response = NULL;
-    if (forward_command(ctx, backup, payload, &response) < 0) {
-        log_event(ctx, "BACKUP sync command failed file=%s server=%d", file->name, file->backup_index);
-    } else {
-        char status[16];
-        if (parse_status(response, status, sizeof(status), NULL, 0) == 0 &&
-            strcmp(status, "OK") == 0) {
-            log_event(ctx, "BACKUP sync succeeded file=%s server=%d", file->name, file->backup_index);
-        } else {
-            log_event(ctx, "BACKUP sync error file=%s server=%d status=%s",
-                      file->name, file->backup_index, status);
-        }
+    int rc = forward_command(ctx, backup, payload, &response);
+    if (rc < 0) {
+        drop_file_backup(ctx, file, "backup unreachable during sync");
+        free(content);
+        free(response);
+        return -1;
     }
+    char status[16];
+    if (parse_status(response, status, sizeof(status), NULL, 0) < 0 ||
+        strcmp(status, "OK") != 0) {
+        drop_file_backup(ctx, file, "backup sync error");
+        log_event(ctx, "BACKUP sync error file=%s server=%d status=%s",
+                  file->name, file->backup_index, status);
+        free(response);
+        free(content);
+        return -1;
+    }
+
+    log_event(ctx, "BACKUP sync succeeded file=%s server=%d", file->name, file->backup_index);
     free(response);
     free(content);
+    return 0;
+}
+
+static void try_assign_backup(struct nm_context *ctx, struct file_entry *file) {
+    if (!file || file->backup_index >= 0 || file->ss_index < 0) {
+        return;
+    }
+    int candidate = nm_pick_backup_server(&ctx->state, file->ss_index);
+    if (candidate < 0) {
+        return;
+    }
+    struct storage_server *backup = nm_get_server(&ctx->state, candidate);
+    if (!server_is_available(backup)) {
+        return;
+    }
+    file->backup_index = candidate;
+    if (replicate_file_to_backup(ctx, file) == 0) {
+        log_event(ctx, "assigned backup file=%s server=%s", file->name, backup->id);
+        nm_state_save(&ctx->state);
+    } else if (file->backup_index == candidate) {
+        file->backup_index = -1;
+        nm_state_save(&ctx->state);
+        log_event(ctx, "failed to assign backup file=%s server=%s", file->name, backup->id);
+    }
 }
 
 static void handle_ss_file_update(struct nm_context *ctx, const char *json) {
@@ -1173,7 +1225,12 @@ static void handle_ss_file_update(struct nm_context *ctx, const char *json) {
                             last_user);
     nm_state_save(&ctx->state);
     if (file->modified != prev_modified) {
-        replicate_file_to_backup(ctx, file);
+        if (file->backup_index >= 0) {
+            replicate_file_to_backup(ctx, file);
+        }
+        if (file->backup_index < 0) {
+            try_assign_backup(ctx, file);
+        }
     }
 }
 
@@ -1207,7 +1264,16 @@ static int handle_ss_register(struct nm_context *ctx, struct peer *p, const char
     p->type = PEER_SERVER;
     p->server_index = idx;
     log_event(ctx, "registered server %s (%s:%s data %s)", id, host, ctrl_port, data_port);
-    return send_ok(p->fd, "\"role\":\"SS\"");
+    int rc = send_ok(p->fd, "\"role\":\"SS\"");
+    if (rc == 0) {
+        for (size_t i = 0; i < ctx->state.file_count; ++i) {
+            struct file_entry *file = &ctx->state.files[i];
+            if (file->backup_index < 0) {
+                try_assign_backup(ctx, file);
+            }
+        }
+    }
+    return rc;
 }
 
 static int handle_handshake(struct nm_context *ctx, struct peer *p, const char *json) {

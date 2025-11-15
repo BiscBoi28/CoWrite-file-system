@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <ctype.h>
+#include <time.h>
 
 #include "common/json_util.h"
 #include "common/net_proto.h"
@@ -182,6 +183,27 @@ static int ss_read(const char *host, const char *port, const char *file, const c
     free(content);
     free(response);
     return 0;
+}
+
+static void format_timestamp(int raw_value, char *buf, size_t buf_len) {
+    if (!buf || buf_len == 0) {
+        return;
+    }
+    if (raw_value <= 0) {
+        snprintf(buf, buf_len, "unknown");
+        return;
+    }
+    time_t ts = (time_t)raw_value;
+    struct tm tm_buf;
+#if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 1
+    struct tm *tm_info = localtime_r(&ts, &tm_buf);
+#else
+    struct tm *tm_tmp = localtime(&ts);
+    struct tm *tm_info = tm_tmp ? memcpy(&tm_buf, tm_tmp, sizeof(struct tm)) : NULL;
+#endif
+    if (!tm_info || strftime(buf, buf_len, "%d-%m-%y %H-%M-%S", tm_info) == 0) {
+        snprintf(buf, buf_len, "unknown");
+    }
 }
 
 static int ss_stream(const char *host, const char *port, const char *file, const char *user, const char *ticket) {
@@ -374,9 +396,6 @@ static int ss_write_session(const char *host,
             continue;
         }
         int server_index = (int)user_index;
-        if (user_index > 0) {
-            server_index = (int)(user_index - 1);
-        }
         char *escaped = json_escape_dup(content);
         if (!escaped) {
             fprintf(stderr, "Out of memory\n");
@@ -605,9 +624,15 @@ static int handle_info_cmd(int nm_fd, const char *file) {
     printf("  Owner: %s\n", owner);
     printf("  Words: %d\n", words);
     printf("  Chars: %d\n", chars);
-    printf("  Created: %d\n", created);
-    printf("  Modified: %d\n", modified);
-    printf("  Last Access: %d by %s\n", last_access, last_user);
+    char created_buf[32];
+    char modified_buf[32];
+    char last_buf[32];
+    format_timestamp(created, created_buf, sizeof(created_buf));
+    format_timestamp(modified, modified_buf, sizeof(modified_buf));
+    format_timestamp(last_access, last_buf, sizeof(last_buf));
+    printf("  Created: %s\n", created_buf);
+    printf("  Modified: %s\n", modified_buf);
+    printf("  Last Access: %s by %s\n", last_buf, last_user[0] ? last_user : "unknown");
     printf("  Primary Server: %s\n", primary[0] ? primary : "unknown");
     printf("  Backup Server: %s\n", backup[0] ? backup : "none");
     free(response);
