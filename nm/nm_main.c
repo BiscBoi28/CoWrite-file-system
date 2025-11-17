@@ -41,6 +41,10 @@ struct peer {
     char user[NM_MAX_USER];
 };
 
+struct active_user {
+    char name[NM_MAX_USER];
+};
+
 struct ticket_entry {
     char token[64];
     char file[NM_MAX_NAME];
@@ -56,6 +60,7 @@ struct nm_context {
     struct peer peers[MAX_PEERS];
     struct nm_state state;
     struct array tickets; /* struct ticket_entry */
+    struct array active_users; /* struct active_user */
     struct log_writer log_general;
     struct log_writer log_requests;
 };
@@ -180,6 +185,53 @@ static void ticket_prune(struct nm_context *ctx) {
             i++;
         }
     }
+}
+
+static int active_user_contains(struct nm_context *ctx, const char *user) {
+    if (!ctx || !user || !user[0]) {
+        return 0;
+    }
+    for (size_t i = 0; i < ctx->active_users.len; ++i) {
+        struct active_user *entry = array_get(&ctx->active_users, i);
+        if (entry && strcmp(entry->name, user) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int active_user_add(struct nm_context *ctx, const char *user) {
+    if (!ctx || !user || !user[0]) {
+        return -1;
+    }
+    if (active_user_contains(ctx, user)) {
+        errno = EEXIST;
+        return -1;
+    }
+    struct active_user entry;
+    memset(&entry, 0, sizeof(entry));
+    snprintf(entry.name, sizeof(entry.name), "%s", user);
+    if (array_push(&ctx->active_users, &entry) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static void active_user_remove(struct nm_context *ctx, const char *user) {
+    if (!ctx || !user || !user[0]) {
+        return;
+    }
+    for (size_t i = 0; i < ctx->active_users.len; ++i) {
+        struct active_user *entry = array_get(&ctx->active_users, i);
+        if (entry && strcmp(entry->name, user) == 0) {
+            array_remove(&ctx->active_users, i);
+            return;
+        }
+    }
+}
+
+static int username_in_use(struct nm_context *ctx, const char *user) {
+    return active_user_contains(ctx, user);
 }
 
 static int forward_command(struct nm_context *ctx,
@@ -440,6 +492,10 @@ static int valid_filename(const char *name) {
 }
 
 static void handle_server_disconnect(struct nm_context *ctx, struct peer *p) {
+    if (p->type == PEER_CLIENT && p->user[0]) {
+        log_event(ctx, "client %s disconnected", p->user);
+        active_user_remove(ctx, p->user);
+    }
     if (p->type == PEER_SERVER && p->server_index >= 0) {
         int server_index = p->server_index;
         nm_mark_server_down(&ctx->state, server_index);
@@ -1248,6 +1304,14 @@ static int handle_client_message(struct nm_context *ctx, struct peer *p, const c
     if (strcmp(type, "EXEC") == 0) {
         return handle_client_exec(ctx, p, json);
     }
+    if (strcmp(type, "CLIENT_EXIT") == 0) {
+        log_request(ctx, "CLIENT_EXIT user=%s", p->user);
+        int rc = send_ok(p->fd, "\"op\":\"EXIT\"");
+        if (rc < 0) {
+            return -1;
+        }
+        return -1;
+    }
     return send_error_response(p->fd, ERR_BADREQ, "unsupported type");
 }
 
@@ -1456,9 +1520,17 @@ static int handle_handshake(struct nm_context *ctx, struct peer *p, const char *
         return handle_ss_register(ctx, p, json);
     }
     if (strcmp(type, "CLIENT_HELLO") == 0) {
-        if (json_get_string(json, "user", p->user, sizeof(p->user)) < 0) {
+        char requested_user[NM_MAX_USER];
+        if (json_get_string(json, "user", requested_user, sizeof(requested_user)) < 0) {
             return send_error_response(p->fd, ERR_BADREQ, "missing user");
         }
+        if (username_in_use(ctx, requested_user)) {
+            return send_error_response(p->fd, ERR_CONFLICT, "username already in use");
+        }
+        if (active_user_add(ctx, requested_user) < 0) {
+            return send_error_response(p->fd, ERR_INTERNAL, "failed to register user");
+        }
+        snprintf(p->user, sizeof(p->user), "%s", requested_user);
         nm_add_user(&ctx->state, p->user);
         p->type = PEER_CLIENT;
         p->server_index = -1;
@@ -1504,6 +1576,7 @@ static void close_context(struct nm_context *ctx) {
         peer_close(&ctx->peers[i]);
     }
     array_free(&ctx->tickets);
+    array_free(&ctx->active_users);
     log_close(&ctx->log_general);
     log_close(&ctx->log_requests);
     nm_state_save(&ctx->state);
@@ -1525,6 +1598,7 @@ int main(int argc, char **argv) {
 
     nm_state_init(&ctx.state, state_path);
     array_init(&ctx.tickets, sizeof(struct ticket_entry));
+    array_init(&ctx.active_users, sizeof(struct active_user));
 
     if (log_open(&ctx.log_general, LOG_GENERAL_PATH) < 0 ||
         log_open(&ctx.log_requests, LOG_REQUESTS_PATH) < 0) {

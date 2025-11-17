@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -38,12 +39,19 @@ struct ticket_table {
     struct array entries; /* struct auth_ticket */
 };
 
+struct sentence_lock {
+    char file[SS_NAME_MAX];
+    int sentence;
+    char user[SS_USER_MAX];
+};
+
 struct write_session {
     int active;
     int sentence_index;
     char user[SS_USER_MAX];
     char *original_text;
     char *sentence_text;
+    char *baseline_sentence;
     struct array sentences; /* char* */
 };
 
@@ -56,8 +64,17 @@ struct ss_context {
     int listen_fd;
     struct ss_state state;
     struct ticket_table tickets;
+    struct array sentence_locks; /* struct sentence_lock */
     struct log_writer log_general;
     struct log_writer log_requests;
+    pthread_rwlock_t state_lock;
+    pthread_mutex_t sentence_lock_mutex;
+    pthread_mutex_t ticket_lock;
+};
+
+struct client_task {
+    struct ss_context *ctx;
+    int client_fd;
 };
 
 /* Forward declarations for helpers */
@@ -94,6 +111,16 @@ static struct auth_ticket *ticket_table_take(struct ticket_table *table,
                                              const char *user,
                                              const char *file,
                                              const char *op);
+static void sentence_lock_table_init(struct ss_context *ctx);
+static void sentence_lock_table_destroy(struct ss_context *ctx);
+static int sentence_lock_acquire(struct ss_context *ctx,
+                                 const char *file,
+                                 int sentence,
+                                 const char *user);
+static void sentence_lock_release(struct ss_context *ctx,
+                                  const char *file,
+                                  const char *user,
+                                  int sentence);
 static int handle_nm_sync(struct ss_context *ctx, const char *json);
 static int handle_nm_ticket_command(struct ss_context *ctx, const char *json);
 static void sleep_ms(int ms);
@@ -176,15 +203,17 @@ static void write_session_clear(struct write_session *session) {
     }
     free(session->original_text);
     free(session->sentence_text);
+    free(session->baseline_sentence);
     session->original_text = NULL;
     session->sentence_text = NULL;
+    session->baseline_sentence = NULL;
     string_array_clear(&session->sentences);
     session->active = 0;
     session->sentence_index = -1;
 }
 
 static int write_session_begin(struct write_session *session,
-                               struct ss_file *file,
+                               const struct ss_file *file,
                                const char *user,
                                int sentence_index) {
     write_session_clear(session);
@@ -210,13 +239,19 @@ static int write_session_begin(struct write_session *session,
         return -1;
     }
 
+    char *existing = NULL;
     if (sentence_index < (int)session->sentences.len) {
-        char *existing = string_array_get_value(&session->sentences, (size_t)sentence_index);
-        session->sentence_text = strdup(existing);
+        existing = string_array_get_value(&session->sentences, (size_t)sentence_index);
+        session->sentence_text = strdup(existing ? existing : "");
+        session->baseline_sentence = existing ? strdup(existing) : NULL;
     } else {
         session->sentence_text = strdup("");
+        session->baseline_sentence = NULL;
     }
     if (!session->sentence_text) {
+        return -1;
+    }
+    if (sentence_index < (int)session->sentences.len && existing && !session->baseline_sentence) {
         return -1;
     }
     return 0;
@@ -230,7 +265,13 @@ static int write_session_apply_insert(struct write_session *session, int index, 
     if (split_words(session->sentence_text, &words) < 0) {
         return -1;
     }
-    if (index < 0 || index > (int)words.len) {
+    if (index < 0) {
+        string_array_clear(&words);
+        errno = EINVAL;
+        return -1;
+    }
+    size_t idx = (size_t)index;
+    if (idx > words.len) {
         string_array_clear(&words);
         errno = EINVAL;
         return -1;
@@ -269,12 +310,18 @@ static int write_session_apply_replace(struct write_session *session,
     if (split_words(session->sentence_text, &words) < 0) {
         return -1;
     }
-    if (index < 0 || index >= (int)words.len) {
+    if (index < 0) {
         string_array_clear(&words);
         errno = EINVAL;
         return -1;
     }
-    string_array_remove(&words, (size_t)index);
+    size_t idx = (size_t)index;
+    if (idx >= words.len) {
+        string_array_clear(&words);
+        errno = EINVAL;
+        return -1;
+    }
+    string_array_remove(&words, idx);
     struct array new_words;
     if (split_words(content, &new_words) < 0) {
         string_array_clear(&words);
@@ -307,12 +354,18 @@ static int write_session_apply_delete(struct write_session *session, int index) 
     if (split_words(session->sentence_text, &words) < 0) {
         return -1;
     }
-    if (index < 0 || index >= (int)words.len) {
+    if (index < 0) {
         string_array_clear(&words);
         errno = EINVAL;
         return -1;
     }
-    string_array_remove(&words, (size_t)index);
+    size_t idx = (size_t)index;
+    if (words.len == 0 || idx >= words.len) {
+        string_array_clear(&words);
+        errno = EINVAL;
+        return -1;
+    }
+    string_array_remove(&words, idx);
     char *joined = join_words(&words);
     string_array_clear(&words);
     if (!joined) {
@@ -326,88 +379,128 @@ static int write_session_apply_delete(struct write_session *session, int index) 
     return 0;
 }
 
+static int append_sentence_list(struct array *dest, struct array *src) {
+    for (size_t i = 0; i < src->len; ++i) {
+        char *value = string_array_get_value(src, i);
+        if (string_array_push(dest, value) < 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static int write_session_commit(struct write_session *session,
-                                struct ss_context *ctx,
-                                struct ss_file *file,
-                                char **out_text) {
-    (void)ctx;
-    struct array final_sentences;
-    string_array_init(&final_sentences);
+                                const struct ss_file *file,
+                                char **out_text,
+                                size_t *out_words,
+                                size_t *out_chars) {
+    char *current_text = load_text(file->data_path, NULL);
+    if (!current_text) {
+        current_text = strdup("");
+        if (!current_text) {
+            return -1;
+        }
+    }
 
-    for (size_t i = 0; i < session->sentences.len; ++i) {
-        char *s = string_array_get_value(&session->sentences, i);
-        if ((int)i == session->sentence_index) {
-            struct array parts;
-            if (split_sentences(session->sentence_text, &parts) < 0) {
-                string_array_clear(&final_sentences);
-                return -1;
-            }
-            if (parts.len == 0) {
-                /* Sentence removed */
-            } else {
-                for (size_t k = 0; k < parts.len; ++k) {
-                    char *part = string_array_get_value(&parts, k);
-                    if (string_array_push(&final_sentences, part) < 0) {
-                        string_array_clear(&parts);
-                        string_array_clear(&final_sentences);
-                        return -1;
-                    }
+    struct array latest_sentences;
+    if (split_sentences(current_text, &latest_sentences) < 0) {
+        free(current_text);
+        return -1;
+    }
+
+    struct array new_parts;
+    if (split_sentences(session->sentence_text, &new_parts) < 0) {
+        string_array_clear(&latest_sentences);
+        free(current_text);
+        return -1;
+    }
+
+    int insert_index = session->sentence_index;
+    if (insert_index < 0) {
+        insert_index = 0;
+    }
+    if (insert_index > (int)latest_sentences.len) {
+        insert_index = (int)latest_sentences.len;
+    }
+
+    int matched_index = -1;
+    const int replacing_existing = (session->baseline_sentence && session->baseline_sentence[0]);
+    if (replacing_existing) {
+        for (size_t i = 0; i < latest_sentences.len; ++i) {
+            char *candidate = string_array_get_value(&latest_sentences, i);
+            if (strcmp(candidate, session->baseline_sentence) == 0) {
+                matched_index = (int)i;
+                if ((int)i >= session->sentence_index) {
+                    insert_index = (int)i;
+                    break;
                 }
+                insert_index = (int)i;
             }
-            string_array_clear(&parts);
-        } else {
-            if (string_array_push(&final_sentences, s) < 0) {
-                string_array_clear(&final_sentences);
-                return -1;
-            }
+        }
+        if (matched_index >= 0) {
+            insert_index = matched_index;
         }
     }
-
-    if (session->sentence_index == (int)session->sentences.len) {
-        struct array parts;
-        if (split_sentences(session->sentence_text, &parts) < 0) {
-            string_array_clear(&final_sentences);
-            return -1;
-        }
-        for (size_t k = 0; k < parts.len; ++k) {
-            char *part = string_array_get_value(&parts, k);
-            if (string_array_push(&final_sentences, part) < 0) {
-                string_array_clear(&parts);
-                string_array_clear(&final_sentences);
-                return -1;
-            }
-        }
-        string_array_clear(&parts);
+    if (insert_index > (int)latest_sentences.len) {
+        insert_index = (int)latest_sentences.len;
     }
 
-    char *text = join_sentences(&final_sentences);
-    string_array_clear(&final_sentences);
+    struct array merged;
+    string_array_init(&merged);
+    int inserted = 0;
+    int removed_original = 0;
+    for (size_t i = 0; i < latest_sentences.len; ++i) {
+        if (!inserted && (int)i == insert_index) {
+            if (append_sentence_list(&merged, &new_parts) < 0) {
+                goto commit_fail;
+            }
+            inserted = 1;
+        }
+        if (replacing_existing && !removed_original && (int)i == insert_index) {
+            removed_original = 1;
+            continue;
+        }
+        char *segment = string_array_get_value(&latest_sentences, i);
+        if (string_array_push(&merged, segment) < 0) {
+            goto commit_fail;
+        }
+    }
+    if (!inserted) {
+        if (append_sentence_list(&merged, &new_parts) < 0) {
+            goto commit_fail;
+        }
+        inserted = 1;
+    }
+
+    char *text = join_sentences(&merged);
+    string_array_clear(&merged);
+    string_array_clear(&new_parts);
+    string_array_clear(&latest_sentences);
     if (!text) {
-        text = strdup("");
-        if (!text) {
-            return -1;
-        }
+        free(current_text);
+        return -1;
     }
 
-    if (store_text_atomic(file->undo_path, session->original_text) < 0) {
+    if (store_text_atomic(file->undo_path, current_text) < 0) {
         free(text);
+        free(current_text);
         return -1;
     }
     if (store_text_atomic(file->data_path, text) < 0) {
         free(text);
+        free(current_text);
         return -1;
     }
+    free(current_text);
 
-    file->char_count = strlen(text);
-    file->word_count = count_words_in_text(text);
-    time_t now = time(NULL);
-    file->modified = now;
-    file->last_access = now;
-    snprintf(file->last_access_user, sizeof(file->last_access_user), "%s", session->user);
-    file->lock_active = 0;
-    file->lock_sentence = -1;
-    ss_state_save_meta(&ctx->state, file);
-
+    size_t new_char_count = strlen(text);
+    size_t new_word_count = count_words_in_text(text);
+    if (out_chars) {
+        *out_chars = new_char_count;
+    }
+    if (out_words) {
+        *out_words = new_word_count;
+    }
     if (out_text) {
         *out_text = text;
     } else {
@@ -415,9 +508,16 @@ static int write_session_commit(struct write_session *session,
     }
     session->active = 0;
     return 0;
+
+commit_fail:
+    string_array_clear(&merged);
+    string_array_clear(&new_parts);
+    string_array_clear(&latest_sentences);
+    free(current_text);
+    return -1;
 }
 
-static void notify_nm_file_update(struct ss_context *ctx, struct ss_file *file) {
+static void notify_nm_file_update(struct ss_context *ctx, const struct ss_file *file) {
     char escaped_name[SS_NAME_MAX * 2];
     char escaped_owner[SS_USER_MAX * 2];
     char escaped_last[SS_USER_MAX * 2];
@@ -440,16 +540,61 @@ static void notify_nm_file_update(struct ss_context *ctx, struct ss_file *file) 
     net_send_json(ctx->nm_fd, payload);
 }
 
+static int snapshot_file(struct ss_context *ctx, const char *file_name, struct ss_file *out) {
+    if (!ctx || !file_name || !out) {
+        return -1;
+    }
+    if (pthread_rwlock_rdlock(&ctx->state_lock) != 0) {
+        return -1;
+    }
+    size_t idx = 0;
+    struct ss_file *file = ss_state_find(&ctx->state, file_name, &idx);
+    if (file) {
+        *out = *file;
+    }
+    pthread_rwlock_unlock(&ctx->state_lock);
+    return file ? 0 : -1;
+}
+
+static void set_file_lock_state(struct ss_context *ctx,
+                                const char *file_name,
+                                int active,
+                                int sentence,
+                                const char *user) {
+    if (pthread_rwlock_wrlock(&ctx->state_lock) != 0) {
+        return;
+    }
+    size_t idx = 0;
+    struct ss_file *file = ss_state_find(&ctx->state, file_name, &idx);
+    if (file) {
+        file->lock_active = active;
+        file->lock_sentence = active ? sentence : -1;
+        if (user && active) {
+            snprintf(file->lock_user, sizeof(file->lock_user), "%s", user);
+        } else {
+            file->lock_user[0] = '\0';
+        }
+    }
+    pthread_rwlock_unlock(&ctx->state_lock);
+}
+
 static int perform_undo(struct ss_context *ctx,
-                        struct ss_file *file,
+                        const char *file_name,
                         const char *user,
-                        char **out_text) {
-    char *undo_text = load_text(file->undo_path, NULL);
+                        char **out_text,
+                        size_t *words_out,
+                        size_t *chars_out) {
+    struct ss_file view;
+    if (snapshot_file(ctx, file_name, &view) < 0) {
+        errno = ENOENT;
+        return -1;
+    }
+    char *undo_text = load_text(view.undo_path, NULL);
     if (!undo_text) {
         errno = ENOENT;
         return -1;
     }
-    char *current_text = load_text(file->data_path, NULL);
+    char *current_text = load_text(view.data_path, NULL);
     if (!current_text) {
         current_text = strdup("");
         if (!current_text) {
@@ -457,24 +602,49 @@ static int perform_undo(struct ss_context *ctx,
             return -1;
         }
     }
-    if (store_text_atomic(file->data_path, undo_text) < 0) {
+    if (store_text_atomic(view.data_path, undo_text) < 0) {
         free(undo_text);
         free(current_text);
         return -1;
     }
-    if (store_text_atomic(file->undo_path, current_text) < 0) {
-        /* Not fatal, but log */
-        log_event(ctx, "Failed to update undo file for %s: %s", file->name, strerror(errno));
+    if (store_text_atomic(view.undo_path, current_text) < 0) {
+        log_event(ctx, "Failed to update undo file for %s: %s", file_name, strerror(errno));
     }
-    file->char_count = strlen(undo_text);
-    file->word_count = count_words_in_text(undo_text);
+    size_t new_chars = strlen(undo_text);
+    size_t new_words = count_words_in_text(undo_text);
     time_t now = time(NULL);
-    file->modified = now;
-    file->last_access = now;
-    snprintf(file->last_access_user, sizeof(file->last_access_user), "%s", user);
-    ss_state_save_meta(&ctx->state, file);
+    struct ss_file notify_copy;
+    int have_meta = 0;
+    if (pthread_rwlock_wrlock(&ctx->state_lock) == 0) {
+        size_t idx = 0;
+        struct ss_file *file = ss_state_find(&ctx->state, file_name, &idx);
+        if (file) {
+            file->char_count = new_chars;
+            file->word_count = new_words;
+            file->modified = now;
+            file->last_access = now;
+            snprintf(file->last_access_user, sizeof(file->last_access_user), "%s", user);
+            ss_state_save_meta(&ctx->state, file);
+            notify_copy = *file;
+            have_meta = 1;
+        }
+        pthread_rwlock_unlock(&ctx->state_lock);
+    }
+    if (!have_meta) {
+        free(undo_text);
+        free(current_text);
+        errno = ENOENT;
+        return -1;
+    }
+    notify_nm_file_update(ctx, &notify_copy);
     log_request(ctx, "UNDO user=%s file=%s words=%zu chars=%zu",
-                user, file->name, file->word_count, file->char_count);
+                user, notify_copy.name, notify_copy.word_count, notify_copy.char_count);
+    if (words_out) {
+        *words_out = new_words;
+    }
+    if (chars_out) {
+        *chars_out = new_chars;
+    }
     if (out_text) {
         *out_text = undo_text;
     } else {
@@ -490,7 +660,9 @@ static int validate_ticket(struct ss_context *ctx,
                            const char *file,
                            const char *op,
                            struct auth_ticket **out_ticket) {
+    pthread_mutex_lock(&ctx->ticket_lock);
     struct auth_ticket *ticket = ticket_table_take(&ctx->tickets, token, user, file, op);
+    pthread_mutex_unlock(&ctx->ticket_lock);
     if (!ticket) {
         errno = EACCES;
         return -1;
@@ -505,10 +677,14 @@ static int validate_ticket(struct ss_context *ctx,
 
 static int handle_read(struct ss_context *ctx,
                        int client_fd,
-                       struct ss_file *file,
+                       const char *file_name,
                        const char *user) {
+    struct ss_file view;
+    if (snapshot_file(ctx, file_name, &view) < 0) {
+        return send_error_response(client_fd, ERR_NOTFOUND, "file not found");
+    }
     size_t size = 0;
-    char *text = load_text(file->data_path, &size);
+    char *text = load_text(view.data_path, &size);
     if (!text) {
         text = strdup("");
         if (!text) {
@@ -521,15 +697,30 @@ static int handle_read(struct ss_context *ctx,
         return send_error_response(client_fd, ERR_INTERNAL, "encode failed");
     }
     time_t now = time(NULL);
-    file->last_access = now;
-    snprintf(file->last_access_user, sizeof(file->last_access_user), "%s", user);
-    ss_state_save_meta(&ctx->state, file);
-    notify_nm_file_update(ctx, file);
-    log_request(ctx, "READ user=%s file=%s", user, file->name);
+    struct ss_file meta_copy;
+    int have_meta = 0;
+    if (pthread_rwlock_wrlock(&ctx->state_lock) == 0) {
+        size_t idx = 0;
+        struct ss_file *file = ss_state_find(&ctx->state, file_name, &idx);
+        if (file) {
+            file->last_access = now;
+            snprintf(file->last_access_user, sizeof(file->last_access_user), "%s", user);
+            ss_state_save_meta(&ctx->state, file);
+            meta_copy = *file;
+            have_meta = 1;
+        }
+        pthread_rwlock_unlock(&ctx->state_lock);
+    }
+    if (have_meta) {
+        notify_nm_file_update(ctx, &meta_copy);
+    }
+    log_request(ctx, "READ user=%s file=%s", user, file_name);
     char extra[MAX_JSON];
+    size_t words = have_meta ? meta_copy.word_count : view.word_count;
+    size_t chars = have_meta ? meta_copy.char_count : view.char_count;
     if (snprintf(extra, sizeof(extra),
                  "\"file\":\"%s\",\"content\":\"%s\",\"words\":%zu,\"chars\":%zu",
-                 file->name, escaped, file->word_count, file->char_count) >= (int)sizeof(extra)) {
+                 view.name, escaped, words, chars) >= (int)sizeof(extra)) {
         free(escaped);
         free(text);
         return send_error_response(client_fd, ERR_INTERNAL, "response too large");
@@ -541,9 +732,13 @@ static int handle_read(struct ss_context *ctx,
 
 static int handle_stream(struct ss_context *ctx,
                          int client_fd,
-                         struct ss_file *file,
+                         const char *file_name,
                          const char *user) {
-    char *text = load_text(file->data_path, NULL);
+    struct ss_file view;
+    if (snapshot_file(ctx, file_name, &view) < 0) {
+        return send_error_response(client_fd, ERR_NOTFOUND, "file not found");
+    }
+    char *text = load_text(view.data_path, NULL);
     if (!text) {
         text = strdup("");
         if (!text) {
@@ -589,33 +784,54 @@ static int handle_stream(struct ss_context *ctx,
     string_array_clear(&words);
     free(text);
     time_t now = time(NULL);
-    file->last_access = now;
-    snprintf(file->last_access_user, sizeof(file->last_access_user), "%s", user);
-    ss_state_save_meta(&ctx->state, file);
-    notify_nm_file_update(ctx, file);
-    log_request(ctx, "STREAM user=%s file=%s words=%zu", user, file->name, file->word_count);
+    struct ss_file meta_copy;
+    int have_meta = 0;
+    if (pthread_rwlock_wrlock(&ctx->state_lock) == 0) {
+        size_t idx = 0;
+        struct ss_file *file = ss_state_find(&ctx->state, file_name, &idx);
+        if (file) {
+            file->last_access = now;
+            snprintf(file->last_access_user, sizeof(file->last_access_user), "%s", user);
+            ss_state_save_meta(&ctx->state, file);
+            meta_copy = *file;
+            have_meta = 1;
+        }
+        pthread_rwlock_unlock(&ctx->state_lock);
+    }
+    if (have_meta) {
+        notify_nm_file_update(ctx, &meta_copy);
+        log_request(ctx, "STREAM user=%s file=%s words=%zu", user, meta_copy.name, meta_copy.word_count);
+    } else {
+        log_request(ctx, "STREAM user=%s file=%s", user, file_name);
+    }
     return 0;
 }
 
 static int handle_write(struct ss_context *ctx,
                         int client_fd,
-                        struct ss_file *file,
+                        const char *file_name,
                         const char *user,
                         int sentence_index) {
-    if (file->lock_active && strcmp(file->lock_user, user) != 0) {
+    struct ss_file view;
+    if (snapshot_file(ctx, file_name, &view) < 0) {
+        return send_error_response(client_fd, ERR_NOTFOUND, "file not found");
+    }
+    if (sentence_lock_acquire(ctx, file_name, sentence_index, user) < 0) {
         return send_error_response(client_fd, ERR_LOCKED, "sentence locked");
     }
-    file->lock_active = 1;
-    file->lock_sentence = sentence_index;
-    snprintf(file->lock_user, sizeof(file->lock_user), "%s", user);
+    int have_sentence_lock = 1;
+    set_file_lock_state(ctx, file_name, 1, sentence_index, user);
 
     struct write_session session;
     write_session_init(&session);
-    if (write_session_begin(&session, file, user, sentence_index) < 0) {
+    if (write_session_begin(&session, &view, user, sentence_index) < 0) {
         int begin_err = errno;
         write_session_clear(&session);
-        file->lock_active = 0;
-        file->lock_sentence = -1;
+        set_file_lock_state(ctx, file_name, 0, -1, NULL);
+        if (have_sentence_lock) {
+            sentence_lock_release(ctx, file_name, user, sentence_index);
+            have_sentence_lock = 0;
+        }
         if (begin_err == EINVAL) {
             return send_error_response(client_fd, ERR_BADREQ, "sentence index out of range");
         }
@@ -625,8 +841,11 @@ static int handle_write(struct ss_context *ctx,
     char *escaped_text = json_escape_dup(session.sentence_text);
     if (!escaped_text) {
         write_session_clear(&session);
-        file->lock_active = 0;
-        file->lock_sentence = -1;
+        set_file_lock_state(ctx, file_name, 0, -1, NULL);
+        if (have_sentence_lock) {
+            sentence_lock_release(ctx, file_name, user, sentence_index);
+            have_sentence_lock = 0;
+        }
         return send_error_response(client_fd, ERR_INTERNAL, "encode failed");
     }
     char extra[MAX_JSON];
@@ -635,19 +854,25 @@ static int handle_write(struct ss_context *ctx,
                  escaped_text, sentence_index) >= (int)sizeof(extra)) {
         free(escaped_text);
         write_session_clear(&session);
-        file->lock_active = 0;
-        file->lock_sentence = -1;
+        set_file_lock_state(ctx, file_name, 0, -1, NULL);
+        if (have_sentence_lock) {
+            sentence_lock_release(ctx, file_name, user, sentence_index);
+            have_sentence_lock = 0;
+        }
         return send_error_response(client_fd, ERR_INTERNAL, "response too large");
     }
     free(escaped_text);
     if (send_ok(client_fd, extra) < 0) {
         write_session_clear(&session);
-        file->lock_active = 0;
-        file->lock_sentence = -1;
+        set_file_lock_state(ctx, file_name, 0, -1, NULL);
+        if (have_sentence_lock) {
+            sentence_lock_release(ctx, file_name, user, sentence_index);
+            have_sentence_lock = 0;
+        }
         return -1;
     }
     log_request(ctx, "WRITE_BEGIN user=%s file=%s sentence=%d",
-                user, file->name, sentence_index);
+                user, file_name, sentence_index);
 
     int result = 0;
     while (1) {
@@ -718,7 +943,9 @@ static int handle_write(struct ss_context *ctx,
             }
         } else if (strcmp(type, "WRITE_COMMIT") == 0) {
             char *final_text = NULL;
-            if (write_session_commit(&session, ctx, file, &final_text) < 0) {
+            size_t new_words = 0;
+            size_t new_chars = 0;
+            if (write_session_commit(&session, &view, &final_text, &new_words, &new_chars) < 0) {
                 send_error_response(client_fd, ERR_INTERNAL, "commit failed");
             } else {
                 char *escaped_final = json_escape_dup(final_text);
@@ -726,7 +953,7 @@ static int handle_write(struct ss_context *ctx,
                     char commit_extra[MAX_JSON];
                     if (snprintf(commit_extra, sizeof(commit_extra),
                                  "\"step\":\"COMMIT\",\"words\":%zu,\"chars\":%zu,\"content\":\"%s\"",
-                                 file->word_count, file->char_count, escaped_final) <
+                                 new_words, new_chars, escaped_final) <
                         (int)sizeof(commit_extra)) {
                         send_ok(client_fd, commit_extra);
                     } else {
@@ -736,9 +963,33 @@ static int handle_write(struct ss_context *ctx,
                 } else {
                     send_ok(client_fd, "\"step\":\"COMMIT\"");
                 }
-                log_request(ctx, "WRITE_COMMIT user=%s file=%s words=%zu chars=%zu",
-                            user, file->name, file->word_count, file->char_count);
-                notify_nm_file_update(ctx, file);
+                struct ss_file notify_copy;
+                int have_meta = 0;
+                time_t now = time(NULL);
+                if (pthread_rwlock_wrlock(&ctx->state_lock) == 0) {
+                    size_t idx = 0;
+                    struct ss_file *state_file = ss_state_find(&ctx->state, file_name, &idx);
+                    if (state_file) {
+                        state_file->char_count = new_chars;
+                        state_file->word_count = new_words;
+                        state_file->modified = now;
+                        state_file->last_access = now;
+                        snprintf(state_file->last_access_user, sizeof(state_file->last_access_user), "%s", user);
+                        state_file->lock_active = 0;
+                        state_file->lock_sentence = -1;
+                        ss_state_save_meta(&ctx->state, state_file);
+                        notify_copy = *state_file;
+                        have_meta = 1;
+                    }
+                    pthread_rwlock_unlock(&ctx->state_lock);
+                }
+                if (have_meta) {
+                    notify_nm_file_update(ctx, &notify_copy);
+                    log_request(ctx, "WRITE_COMMIT user=%s file=%s words=%zu chars=%zu",
+                                user, notify_copy.name, notify_copy.word_count, notify_copy.char_count);
+                } else {
+                    log_request(ctx, "WRITE_COMMIT user=%s file=%s", user, file_name);
+                }
                 free(final_text);
             }
             write_session_clear(&session);
@@ -749,7 +1000,7 @@ static int handle_write(struct ss_context *ctx,
             send_ok(client_fd, "\"step\":\"ABORT\"");
             write_session_clear(&session);
             result = 0;
-            log_request(ctx, "WRITE_ABORT user=%s file=%s", user, file->name);
+            log_request(ctx, "WRITE_ABORT user=%s file=%s", user, file_name);
             free(json);
             break;
         } else {
@@ -761,8 +1012,11 @@ static int handle_write(struct ss_context *ctx,
     if (session.active) {
         write_session_clear(&session);
     }
-    file->lock_active = 0;
-    file->lock_sentence = -1;
+    if (have_sentence_lock) {
+        sentence_lock_release(ctx, file_name, user, sentence_index);
+        have_sentence_lock = 0;
+    }
+    set_file_lock_state(ctx, file_name, 0, -1, NULL);
     return result;
 }
 
@@ -786,26 +1040,18 @@ static void handle_data_client(struct ss_context *ctx, int client_fd) {
         net_close(client_fd);
         return;
     }
-    size_t index = 0;
-    struct ss_file *file = ss_state_find(&ctx->state, file_name, &index);
-    if (!file) {
-        send_error_response(client_fd, ERR_NOTFOUND, "file not found");
-        free(json);
-        net_close(client_fd);
-        return;
-    }
     struct auth_ticket *ticket = NULL;
     if (strcmp(type, "READ") == 0) {
         if (validate_ticket(ctx, token, user, file_name, "READ", &ticket) < 0) {
             send_error_response(client_fd, ERR_NOAUTH, "invalid ticket");
         } else {
-            handle_read(ctx, client_fd, file, user);
+            handle_read(ctx, client_fd, file_name, user);
         }
     } else if (strcmp(type, "STREAM") == 0) {
         if (validate_ticket(ctx, token, user, file_name, "STREAM", &ticket) < 0) {
             send_error_response(client_fd, ERR_NOAUTH, "invalid ticket");
         } else {
-            handle_stream(ctx, client_fd, file, user);
+            handle_stream(ctx, client_fd, file_name, user);
         }
     } else if (strcmp(type, "WRITE_BEGIN") == 0) {
         int sentence_index = 0;
@@ -814,7 +1060,7 @@ static void handle_data_client(struct ss_context *ctx, int client_fd) {
         } else if (validate_ticket(ctx, token, user, file_name, "WRITE", &ticket) < 0) {
             send_error_response(client_fd, ERR_NOAUTH, "invalid ticket");
         } else {
-            handle_write(ctx, client_fd, file, user, sentence_index);
+            handle_write(ctx, client_fd, file_name, user, sentence_index);
         }
     } else {
         send_error_response(client_fd, ERR_BADREQ, "unsupported operation");
@@ -822,6 +1068,16 @@ static void handle_data_client(struct ss_context *ctx, int client_fd) {
     free(ticket);
     free(json);
     net_close(client_fd);
+}
+
+static void *data_client_thread(void *arg) {
+    struct client_task *task = arg;
+    if (!task) {
+        return NULL;
+    }
+    handle_data_client(task->ctx, task->client_fd);
+    free(task);
+    return NULL;
 }
 
 static int ss_fetch_remote_content(const char *host,
@@ -897,20 +1153,21 @@ static int handle_nm_sync(struct ss_context *ctx, const char *json) {
     if (ss_fetch_remote_content(source_host, source_port, file_name, owner, ticket, &content) < 0) {
         return send_error_response(ctx->nm_fd, ERR_INTERNAL, "sync failed");
     }
-    size_t idx = 0;
-    struct ss_file *file = ss_state_find(&ctx->state, file_name, &idx);
-    if (!file) {
-        if (ss_state_add(&ctx->state, file_name, owner) < 0) {
-            free(content);
-            return send_error_response(ctx->nm_fd, ERR_INTERNAL, "sync failed");
+    struct ss_file view;
+    if (snapshot_file(ctx, file_name, &view) < 0) {
+        int added = 0;
+        if (pthread_rwlock_wrlock(&ctx->state_lock) == 0) {
+            if (ss_state_add(&ctx->state, file_name, owner) == 0) {
+                added = 1;
+            }
+            pthread_rwlock_unlock(&ctx->state_lock);
         }
-        file = ss_state_find(&ctx->state, file_name, &idx);
-        if (!file) {
+        if (!added || snapshot_file(ctx, file_name, &view) < 0) {
             free(content);
             return send_error_response(ctx->nm_fd, ERR_INTERNAL, "sync failed");
         }
     }
-    char *existing = load_text(file->data_path, NULL);
+    char *existing = load_text(view.data_path, NULL);
     if (!existing) {
         existing = strdup("");
         if (!existing) {
@@ -918,24 +1175,42 @@ static int handle_nm_sync(struct ss_context *ctx, const char *json) {
             return send_error_response(ctx->nm_fd, ERR_INTERNAL, "sync failed");
         }
     }
-    if (store_text_atomic(file->undo_path, existing) < 0) {
+    if (store_text_atomic(view.undo_path, existing) < 0) {
         free(existing);
         free(content);
         return send_error_response(ctx->nm_fd, ERR_INTERNAL, "sync failed");
     }
     free(existing);
-    if (store_text_atomic(file->data_path, content) < 0) {
+    if (store_text_atomic(view.data_path, content) < 0) {
         free(content);
         return send_error_response(ctx->nm_fd, ERR_INTERNAL, "sync failed");
     }
-    file->char_count = strlen(content);
-    file->word_count = count_words_in_text(content);
+    size_t new_chars = strlen(content);
+    size_t new_words = count_words_in_text(content);
     time_t now = time(NULL);
-    file->modified = now;
-    file->last_access = now;
-    snprintf(file->last_access_user, sizeof(file->last_access_user), "%s", owner);
-    ss_state_save_meta(&ctx->state, file);
+    struct ss_file notify_copy;
+    int have_meta = 0;
+    if (pthread_rwlock_wrlock(&ctx->state_lock) == 0) {
+        size_t idx = 0;
+        struct ss_file *file = ss_state_find(&ctx->state, file_name, &idx);
+        if (file) {
+            file->char_count = new_chars;
+            file->word_count = new_words;
+            file->modified = now;
+            file->last_access = now;
+            snprintf(file->last_access_user, sizeof(file->last_access_user), "%s", owner);
+            ss_state_save_meta(&ctx->state, file);
+            notify_copy = *file;
+            have_meta = 1;
+        }
+        pthread_rwlock_unlock(&ctx->state_lock);
+    }
+    if (!have_meta) {
+        free(content);
+        return send_error_response(ctx->nm_fd, ERR_INTERNAL, "sync failed");
+    }
     log_request(ctx, "SYNC file=%s owner=%s", file_name, owner);
+    notify_nm_file_update(ctx, &notify_copy);
     free(content);
     return send_ok(ctx->nm_fd, "\"op\":\"SYNC\"");
 }
@@ -953,7 +1228,10 @@ static int handle_nm_ticket_command(struct ss_context *ctx, const char *json) {
         json_get_int(json, "expiry", &expiry) < 0) {
         return send_error_response(ctx->nm_fd, ERR_BADREQ, "invalid ticket");
     }
-    if (ticket_table_add(&ctx->tickets, token, file_name, user, op, (time_t)expiry) < 0) {
+    pthread_mutex_lock(&ctx->ticket_lock);
+    int rc = ticket_table_add(&ctx->tickets, token, file_name, user, op, (time_t)expiry);
+    pthread_mutex_unlock(&ctx->ticket_lock);
+    if (rc < 0) {
         return send_error_response(ctx->nm_fd, ERR_INTERNAL, "ticket failed");
     }
     return send_ok(ctx->nm_fd, "\"op\":\"TICKET\"");
@@ -978,57 +1256,66 @@ static int process_nm_command(struct ss_context *ctx) {
             json_get_string(json, "owner", owner, sizeof(owner)) < 0 ||
             !valid_filename(name)) {
             send_error_response(ctx->nm_fd, ERR_BADREQ, "invalid create");
-        } else if (ss_state_add(&ctx->state, name, owner) < 0) {
-            send_error_response(ctx->nm_fd, ERR_EXISTS, strerror(errno));
         } else {
-            send_ok(ctx->nm_fd, "\"op\":\"CREATE\"");
+            int rc = -1;
+            if (pthread_rwlock_wrlock(&ctx->state_lock) == 0) {
+                rc = ss_state_add(&ctx->state, name, owner);
+                pthread_rwlock_unlock(&ctx->state_lock);
+            }
+            if (rc < 0) {
+                send_error_response(ctx->nm_fd, ERR_EXISTS, strerror(errno));
+            } else {
+                send_ok(ctx->nm_fd, "\"op\":\"CREATE\"");
+            }
         }
     } else if (strcmp(type, "NM_DELETE") == 0) {
         char name[SS_NAME_MAX];
         if (json_get_string(json, "file", name, sizeof(name)) < 0 ||
             !valid_filename(name)) {
             send_error_response(ctx->nm_fd, ERR_BADREQ, "invalid delete");
-        } else if (ss_state_remove(&ctx->state, name) < 0) {
-            send_error_response(ctx->nm_fd, ERR_NOTFOUND, "file missing");
         } else {
-            send_ok(ctx->nm_fd, "\"op\":\"DELETE\"");
+            int rc = -1;
+            if (pthread_rwlock_wrlock(&ctx->state_lock) == 0) {
+                rc = ss_state_remove(&ctx->state, name);
+                pthread_rwlock_unlock(&ctx->state_lock);
+            }
+            if (rc < 0) {
+                send_error_response(ctx->nm_fd, ERR_NOTFOUND, "file missing");
+            } else {
+                send_ok(ctx->nm_fd, "\"op\":\"DELETE\"");
+            }
         }
     } else if (strcmp(type, "NM_TICKET") == 0) {
         handle_nm_ticket_command(ctx, json);
-    } else if (strcmp(type, "NM_UNDO") == 0) {
+        } else if (strcmp(type, "NM_UNDO") == 0) {
         char file_name[SS_NAME_MAX];
         char user[SS_USER_MAX];
         if (json_get_string(json, "file", file_name, sizeof(file_name)) < 0 ||
             json_get_string(json, "user", user, sizeof(user)) < 0) {
             send_error_response(ctx->nm_fd, ERR_BADREQ, "invalid undo");
         } else {
-            size_t idx = 0;
-            struct ss_file *file = ss_state_find(&ctx->state, file_name, &idx);
-            if (!file) {
-                send_error_response(ctx->nm_fd, ERR_NOTFOUND, "file missing");
+            char *text = NULL;
+            size_t undo_words = 0;
+            size_t undo_chars = 0;
+            if (perform_undo(ctx, file_name, user, &text, &undo_words, &undo_chars) < 0) {
+                send_error_response(ctx->nm_fd, ERR_CONFLICT, "undo failed");
             } else {
-                char *text = NULL;
-                if (perform_undo(ctx, file, user, &text) < 0) {
-                    send_error_response(ctx->nm_fd, ERR_CONFLICT, "undo failed");
-                } else {
-                    char *escaped = json_escape_dup(text);
-                    if (escaped) {
-                        char extra[MAX_JSON];
-                        if (snprintf(extra, sizeof(extra),
-                                     "\"op\":\"UNDO\",\"words\":%zu,\"chars\":%zu,\"content\":\"%s\"",
-                                     file->word_count, file->char_count, escaped) <
-                            (int)sizeof(extra)) {
-                            send_ok(ctx->nm_fd, extra);
-                        } else {
-                            send_ok(ctx->nm_fd, "\"op\":\"UNDO\"");
-                        }
-                        free(escaped);
+                char *escaped = json_escape_dup(text);
+                if (escaped) {
+                    char extra[MAX_JSON];
+                    if (snprintf(extra, sizeof(extra),
+                                 "\"op\":\"UNDO\",\"words\":%zu,\"chars\":%zu,\"content\":\"%s\"",
+                                 undo_words, undo_chars, escaped) <
+                        (int)sizeof(extra)) {
+                        send_ok(ctx->nm_fd, extra);
                     } else {
                         send_ok(ctx->nm_fd, "\"op\":\"UNDO\"");
                     }
-                    notify_nm_file_update(ctx, file);
-                    free(text);
+                    free(escaped);
+                } else {
+                    send_ok(ctx->nm_fd, "\"op\":\"UNDO\"");
                 }
+                free(text);
             }
         }
     } else if (strcmp(type, "NM_SYNC") == 0) {
@@ -1045,6 +1332,9 @@ static int process_nm_command(struct ss_context *ctx) {
 static void build_file_list(struct ss_context *ctx, char *out, size_t out_size) {
     size_t offset = 0;
     out[0] = '\0';
+    if (pthread_rwlock_rdlock(&ctx->state_lock) != 0) {
+        return;
+    }
     for (size_t i = 0; i < ctx->state.files.len; ++i) {
         struct ss_file *file = array_get(&ctx->state.files, i);
         if (offset != 0) {
@@ -1061,6 +1351,7 @@ static void build_file_list(struct ss_context *ctx, char *out, size_t out_size) 
         offset += len;
         out[offset] = '\0';
     }
+    pthread_rwlock_unlock(&ctx->state_lock);
 }
 
 int main(int argc, char **argv) {
@@ -1090,8 +1381,18 @@ int main(int argc, char **argv) {
     int exit_code = 0;
     bool logs_opened = false;
 
+    if (pthread_rwlock_init(&ctx.state_lock, NULL) != 0 ||
+        pthread_mutex_init(&ctx.sentence_lock_mutex, NULL) != 0 ||
+        pthread_mutex_init(&ctx.ticket_lock, NULL) != 0) {
+        fprintf(stderr, "Failed to initialise synchronization primitives\n");
+        return 1;
+    }
+
     if (ss_state_init(&ctx.state, storage_dir) < 0) {
         fprintf(stderr, "Failed to initialise storage state: %s\n", strerror(errno));
+        pthread_rwlock_destroy(&ctx.state_lock);
+        pthread_mutex_destroy(&ctx.sentence_lock_mutex);
+        pthread_mutex_destroy(&ctx.ticket_lock);
         return 1;
     }
 
@@ -1121,6 +1422,7 @@ int main(int argc, char **argv) {
     logs_opened = true;
 
     ticket_table_init(&ctx.tickets);
+    sentence_lock_table_init(&ctx);
     randutil_seed();
 
     ctx.nm_fd = net_connect(nm_host, nm_port);
@@ -1230,7 +1532,20 @@ int main(int argc, char **argv) {
             socklen_t addrlen = sizeof(addr);
             int client_fd = accept(ctx.listen_fd, (struct sockaddr *)&addr, &addrlen);
             if (client_fd >= 0) {
-                handle_data_client(&ctx, client_fd);
+                struct client_task *task = malloc(sizeof(*task));
+                if (!task) {
+                    net_close(client_fd);
+                } else {
+                    task->ctx = &ctx;
+                    task->client_fd = client_fd;
+                    pthread_t tid;
+                    if (pthread_create(&tid, NULL, data_client_thread, task) != 0) {
+                        net_close(client_fd);
+                        free(task);
+                    } else {
+                        pthread_detach(tid);
+                    }
+                }
             }
         }
     }
@@ -1243,6 +1558,10 @@ cleanup:
         net_close(ctx.nm_fd);
     }
     ticket_table_destroy(&ctx.tickets);
+    sentence_lock_table_destroy(&ctx);
+    pthread_rwlock_destroy(&ctx.state_lock);
+    pthread_mutex_destroy(&ctx.sentence_lock_mutex);
+    pthread_mutex_destroy(&ctx.ticket_lock);
     if (logs_opened) {
         log_close(&ctx.log_general);
         log_close(&ctx.log_requests);
@@ -1327,6 +1646,63 @@ static struct auth_ticket *ticket_table_take(struct ticket_table *table,
         }
     }
     return NULL;
+}
+
+static void sentence_lock_table_init(struct ss_context *ctx) {
+    array_init(&ctx->sentence_locks, sizeof(struct sentence_lock));
+}
+
+static void sentence_lock_table_destroy(struct ss_context *ctx) {
+    array_free(&ctx->sentence_locks);
+}
+
+static struct sentence_lock *sentence_lock_find(struct ss_context *ctx,
+                                                const char *file,
+                                                int sentence) {
+    for (size_t i = 0; i < ctx->sentence_locks.len; ++i) {
+        struct sentence_lock *entry = array_get(&ctx->sentence_locks, i);
+        if (entry && entry->sentence == sentence && strcmp(entry->file, file) == 0) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+static int sentence_lock_acquire(struct ss_context *ctx,
+                                 const char *file,
+                                 int sentence,
+                                 const char *user) {
+    pthread_mutex_lock(&ctx->sentence_lock_mutex);
+    struct sentence_lock *existing = sentence_lock_find(ctx, file, sentence);
+    if (existing) {
+        pthread_mutex_unlock(&ctx->sentence_lock_mutex);
+        errno = EBUSY;
+        return -1;
+    }
+    struct sentence_lock entry;
+    memset(&entry, 0, sizeof(entry));
+    snprintf(entry.file, sizeof(entry.file), "%s", file);
+    snprintf(entry.user, sizeof(entry.user), "%s", user);
+    entry.sentence = sentence;
+    int rc = array_push(&ctx->sentence_locks, &entry);
+    pthread_mutex_unlock(&ctx->sentence_lock_mutex);
+    return rc;
+}
+
+static void sentence_lock_release(struct ss_context *ctx,
+                                  const char *file,
+                                  const char *user,
+                                  int sentence) {
+    (void)user;
+    pthread_mutex_lock(&ctx->sentence_lock_mutex);
+    for (size_t i = 0; i < ctx->sentence_locks.len; ++i) {
+        struct sentence_lock *entry = array_get(&ctx->sentence_locks, i);
+        if (entry && entry->sentence == sentence && strcmp(entry->file, file) == 0) {
+            array_remove(&ctx->sentence_locks, i);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&ctx->sentence_lock_mutex);
 }
 
 static void string_array_init(struct array *arr) {

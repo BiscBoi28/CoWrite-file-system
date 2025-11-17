@@ -971,6 +971,22 @@ static int handle_exec_cmd(int nm_fd, const char *file) {
     return 0;
 }
 
+static int handle_exit_cmd(int nm_fd) {
+    char *response = NULL;
+    if (nm_call(nm_fd, &response, "CLIENT_EXIT", NULL) < 0) {
+        fprintf(stderr, "Failed to contact NM\n");
+        return -1;
+    }
+    char status[16];
+    if (parse_status(response, status, sizeof(status), NULL, 0) < 0 || strcmp(status, "OK") != 0) {
+        print_error_response(response);
+        free(response);
+        return -1;
+    }
+    free(response);
+    return 0;
+}
+
 static void print_help(void) {
     printf("Commands:\n");
     printf("  VIEW [-a] [-l]\n");
@@ -988,7 +1004,7 @@ static void print_help(void) {
     printf("  UNDO <file>\n");
     printf("  EXEC <file>\n");
     printf("  HELP\n");
-    printf("  QUIT\n");
+    printf("  QUIT / EXIT  (disconnect client)\n");
 }
 
 int main(int argc, char **argv) {
@@ -1264,7 +1280,8 @@ int main(int argc, char **argv) {
             handle_exec_cmd(nm_fd, file);
             continue;
         }
-        if (strcmp(cmd, "QUIT") == 0) {
+        if (strcmp(cmd, "QUIT") == 0 || strcmp(cmd, "EXIT") == 0) {
+            handle_exit_cmd(nm_fd);
             break;
         }
         printf("Unknown command. Type 'help'.\n");

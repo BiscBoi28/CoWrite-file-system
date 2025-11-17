@@ -1,6 +1,6 @@
 CC := gcc
-CFLAGS := -Wall -Wextra -Werror -std=c11 -pedantic -I.
-LDFLAGS :=
+CFLAGS := -Wall -Wextra -Werror -std=c11 -pedantic -I. -pthread
+LDFLAGS := -pthread
 
 COMMON_SRCS := common/net_proto.c common/json_util.c common/error.c common/log.c common/array.c common/randutil.c
 COMMON_OBJS := $(COMMON_SRCS:.c=.o)
