@@ -1,0 +1,6 @@
+~? and ! limiter testing
+~stream and then close server  to testing
+~backup primary backup and unkown
+can connect  as the same client for some  reason
+exit for users should add
+instead of file locking, sentence locking is there

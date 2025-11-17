@@ -463,7 +463,6 @@ static void handle_server_disconnect(struct nm_context *ctx, struct peer *p) {
                         file_dirty = 1;
                     } else {
                         drop_backup_only(ctx, file, "backup unavailable during failover");
-                        file->ss_index = -1;
                         log_event(ctx,
                                   "file=%s has no replicas after server=%d down",
                                   file->name,
@@ -471,7 +470,6 @@ static void handle_server_disconnect(struct nm_context *ctx, struct peer *p) {
                         file_dirty = 1;
                     }
                 } else {
-                    file->ss_index = -1;
                     log_event(ctx,
                               "file=%s primary offline server=%d and no backup",
                               file->name,
@@ -566,6 +564,8 @@ static int handle_client_view(struct nm_context *ctx, struct peer *p, const char
         }
         char primary_id[256] = "";
         char backup_id[256] = "";
+        const char *primary_status = "none";
+        const char *backup_status = "none";
         struct storage_server *primary = (file->ss_index >= 0)
                                            ? nm_get_server(&ctx->state, file->ss_index)
                                            : NULL;
@@ -574,9 +574,15 @@ static int handle_client_view(struct nm_context *ctx, struct peer *p, const char
                                           : NULL;
         if (primary) {
             json_escape_string(primary_id, sizeof(primary_id), primary->id);
+            primary_status = server_is_available(primary) ? "online" : "offline";
+        } else if (file->ss_index >= 0) {
+            primary_status = "unknown";
         }
         if (backup) {
             json_escape_string(backup_id, sizeof(backup_id), backup->id);
+            backup_status = server_is_available(backup) ? "online" : "offline";
+        } else if (file->backup_index >= 0) {
+            backup_status = "unknown";
         }
         if (long_format) {
             json_append(extra, sizeof(extra), &offset,
@@ -586,9 +592,12 @@ static int handle_client_view(struct nm_context *ctx, struct peer *p, const char
                         "\"chars\":%zu,\"lastAccess\":%ld,\"lastAccessUser\":\"%s\",",
                         file->char_count, (long)file->last_access, last_user_esc);
             json_append(extra, sizeof(extra), &offset,
-                        "\"primaryServer\":\"%s\",\"backupServer\":\"%s\"}",
+                        "\"primaryServer\":\"%s\",\"primaryStatus\":\"%s\","
+                        "\"backupServer\":\"%s\",\"backupStatus\":\"%s\"}",
                         primary_id[0] ? primary_id : "",
-                        backup_id[0] ? backup_id : "");
+                        primary_status,
+                        backup_id[0] ? backup_id : "",
+                        backup_status);
         } else {
             json_append(extra, sizeof(extra), &offset, "{\"name\":\"%s\"}", name_esc);
         }
@@ -646,6 +655,8 @@ static int handle_client_info(struct nm_context *ctx, struct peer *p, const char
     }
     char primary_id[256] = "";
     char backup_id[256] = "";
+    const char *primary_status = "none";
+    const char *backup_status = "none";
     struct storage_server *primary = (file->ss_index >= 0)
                                        ? nm_get_server(&ctx->state, file->ss_index)
                                        : NULL;
@@ -654,9 +665,15 @@ static int handle_client_info(struct nm_context *ctx, struct peer *p, const char
                                       : NULL;
     if (primary) {
         json_escape_string(primary_id, sizeof(primary_id), primary->id);
+        primary_status = server_is_available(primary) ? "online" : "offline";
+    } else if (file->ss_index >= 0) {
+        primary_status = "unknown";
     }
     if (backup) {
         json_escape_string(backup_id, sizeof(backup_id), backup->id);
+        backup_status = server_is_available(backup) ? "online" : "offline";
+    } else if (file->backup_index >= 0) {
+        backup_status = "unknown";
     }
     char extra[MAX_JSON];
     int offset = 0;
@@ -670,9 +687,12 @@ static int handle_client_info(struct nm_context *ctx, struct peer *p, const char
                 "\"lastAccess\":%ld,\"lastAccessUser\":\"%s\",",
                 (long)file->last_access, last_user_esc);
     json_append(extra, sizeof(extra), &offset,
-                "\"primaryServer\":\"%s\",\"backupServer\":\"%s\"}",
+                "\"primaryServer\":\"%s\",\"primaryStatus\":\"%s\","
+                "\"backupServer\":\"%s\",\"backupStatus\":\"%s\"}",
                 primary_id[0] ? primary_id : "",
-                backup_id[0] ? backup_id : "");
+                primary_status,
+                backup_id[0] ? backup_id : "",
+                backup_status);
     if (offset < 0) {
         return send_error_response(p->fd, ERR_INTERNAL, "response too large");
     }
@@ -883,14 +903,12 @@ static void refresh_file_servers(struct nm_context *ctx, struct file_entry *file
                               file->ss_index);
                     file->ss_index = file->backup_index;
                     file->backup_index = -1;
+                    state_dirty = 1;
                 } else {
                     drop_backup_only(ctx, file, "backup unavailable during refresh");
-                    file->ss_index = -1;
+                    state_dirty = 1;
                 }
-            } else {
-                file->ss_index = -1;
             }
-            state_dirty = 1;
         }
     }
     if (file->backup_index >= 0) {
@@ -1305,6 +1323,10 @@ static int replicate_file_to_backup(struct nm_context *ctx, struct file_entry *f
 
 static void try_assign_backup(struct nm_context *ctx, struct file_entry *file) {
     if (!file || file->backup_index >= 0 || file->ss_index < 0) {
+        return;
+    }
+    struct storage_server *primary = nm_get_server(&ctx->state, file->ss_index);
+    if (!server_is_available(primary)) {
         return;
     }
     int attempted = 0;

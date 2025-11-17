@@ -208,6 +208,42 @@ static void format_timestamp(int raw_value, char *buf, size_t buf_len) {
     }
 }
 
+static void describe_server_status(char *buf, size_t buf_len, const char *id, const char *status) {
+    if (!buf || buf_len == 0) {
+        return;
+    }
+    const char *state = (status && status[0]) ? status : NULL;
+    if (state && strcmp(state, "offline") == 0) {
+        if (id && id[0]) {
+            snprintf(buf, buf_len, "offline (last: %s)", id);
+        } else {
+            snprintf(buf, buf_len, "offline");
+        }
+        return;
+    }
+    if (state && strcmp(state, "none") == 0) {
+        snprintf(buf, buf_len, "none");
+        return;
+    }
+    if (state && strcmp(state, "online") == 0) {
+        if (id && id[0]) {
+            snprintf(buf, buf_len, "%s", id);
+        } else {
+            snprintf(buf, buf_len, "unknown");
+        }
+        return;
+    }
+    if (id && id[0]) {
+        snprintf(buf, buf_len, "%s", id);
+        return;
+    }
+    if (state && state[0]) {
+        snprintf(buf, buf_len, "%s", state);
+        return;
+    }
+    snprintf(buf, buf_len, "unknown");
+}
+
 static int ss_stream(const char *host, const char *port, const char *file, const char *user, const char *ticket) {
     int fd = net_connect(host, port);
     if (fd < 0) {
@@ -493,6 +529,10 @@ static int handle_view(int nm_fd, const char *flags) {
             char last_user[128];
             char primary[128] = "";
             char backup[128] = "";
+            char primary_status[32] = "";
+            char backup_status[32] = "";
+            char primary_display[192];
+            char backup_display[192];
             int words = -1;
             int chars = -1;
             int have_owner = json_get_string(chunk, "owner", owner, sizeof(owner)) == 0;
@@ -502,11 +542,17 @@ static int handle_view(int nm_fd, const char *flags) {
                     json_get_string(chunk, "lastAccessUser", last_user, sizeof(last_user)) == 0) {
                     json_get_string(chunk, "primaryServer", primary, sizeof(primary));
                     json_get_string(chunk, "backupServer", backup, sizeof(backup));
+                    json_get_string(chunk, "primaryStatus", primary_status, sizeof(primary_status));
+                    json_get_string(chunk, "backupStatus", backup_status, sizeof(backup_status));
+                    describe_server_status(primary_display, sizeof(primary_display),
+                                            primary, primary_status);
+                    describe_server_status(backup_display, sizeof(backup_display),
+                                            backup, backup_status);
                     printf("  %s (owner: %s, words: %d, chars: %d, last user: %s)\n",
                            name, owner, words, chars, last_user);
                     printf("    primary: %s, backup: %s\n",
-                           primary[0] ? primary : "none",
-                           backup[0] ? backup : "none");
+                           primary_display,
+                           backup_display);
                 } else {
                     printf("  %s\n", name);
                 }
@@ -607,6 +653,10 @@ static int handle_info_cmd(int nm_fd, const char *file) {
     char last_user[128] = "";
     char primary[128] = "";
     char backup[128] = "";
+    char primary_status[32] = "";
+    char backup_status[32] = "";
+    char primary_display[192];
+    char backup_display[192];
     int words = -1;
     int chars = -1;
     int created = 0;
@@ -622,6 +672,10 @@ static int handle_info_cmd(int nm_fd, const char *file) {
     json_get_string(chunk, "lastAccessUser", last_user, sizeof(last_user));
     json_get_string(chunk, "primaryServer", primary, sizeof(primary));
     json_get_string(chunk, "backupServer", backup, sizeof(backup));
+    json_get_string(chunk, "primaryStatus", primary_status, sizeof(primary_status));
+    json_get_string(chunk, "backupStatus", backup_status, sizeof(backup_status));
+    describe_server_status(primary_display, sizeof(primary_display), primary, primary_status);
+    describe_server_status(backup_display, sizeof(backup_display), backup, backup_status);
     printf("File: %s\n", name[0] ? name : file);
     printf("  Owner: %s\n", owner);
     printf("  Words: %d\n", words);
@@ -635,8 +689,8 @@ static int handle_info_cmd(int nm_fd, const char *file) {
     printf("  Created: %s\n", created_buf);
     printf("  Modified: %s\n", modified_buf);
     printf("  Last Access: %s by %s\n", last_buf, last_user[0] ? last_user : "unknown");
-    printf("  Primary Server: %s\n", primary[0] ? primary : "unknown");
-    printf("  Backup Server: %s\n", backup[0] ? backup : "none");
+    printf("  Primary Server: %s\n", primary_display);
+    printf("  Backup Server: %s\n", backup_display);
     free(response);
     return 0;
 }
