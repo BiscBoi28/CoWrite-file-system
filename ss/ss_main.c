@@ -2,12 +2,14 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <libgen.h>
+#include <limits.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -26,6 +28,10 @@
 #define MAX_TOKEN_LEN 64
 #define MAX_JSON 4096
 #define STREAM_DELAY_MS 100
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 struct auth_ticket {
     char token[64];
@@ -136,6 +142,130 @@ static int ensure_directory(const char *path) {
     if (mkdir(path, 0755) < 0 && errno != EEXIST) {
         return -1;
     }
+    return 0;
+}
+
+static int path_uses_temp_alias(const char *path) {
+    if (!path) {
+        return 0;
+    }
+    if (strncmp(path, "/temp", 5) != 0) {
+        return 0;
+    }
+    return path[5] == '\0' || path[5] == '/';
+}
+
+static int get_workspace_root(char *out, size_t out_len) {
+    if (!out || out_len == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    char exe_path[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (len < 0) {
+        return -1;
+    }
+    if ((size_t)len >= sizeof(exe_path) - 1) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    exe_path[len] = '\0';
+    if (!exe_path[0]) {
+        return -1;
+    }
+    char bin_dir[PATH_MAX];
+    if (snprintf(bin_dir, sizeof(bin_dir), "%s", exe_path) >= (int)sizeof(bin_dir)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    char *parent = dirname(bin_dir);
+    if (!parent) {
+        errno = EINVAL;
+        return -1;
+    }
+    char repo_dir[PATH_MAX];
+    if (snprintf(repo_dir, sizeof(repo_dir), "%s", parent) >= (int)sizeof(repo_dir)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    char *repo_root = dirname(repo_dir);
+    if (!repo_root) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (snprintf(out, out_len, "%s", repo_root) >= (int)out_len) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+static int resolve_storage_directory(const char *workspace_root,
+                                     const char *requested,
+                                     char *resolved,
+                                     size_t resolved_len,
+                                     int *used_workspace_base) {
+    if (!requested || !resolved || resolved_len == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (used_workspace_base) {
+        *used_workspace_base = 0;
+    }
+    if (requested[0] == '/') {
+        if (path_uses_temp_alias(requested)) {
+            if (!workspace_root || !workspace_root[0]) {
+                errno = EINVAL;
+                return -1;
+            }
+            const char *relative = requested + 1; /* trim leading slash */
+            if (!relative[0]) {
+                relative = "temp";
+            }
+            if (snprintf(resolved, resolved_len, "%s/%s", workspace_root, relative) >=
+                (int)resolved_len) {
+                errno = ENAMETOOLONG;
+                return -1;
+            }
+            if (used_workspace_base) {
+                *used_workspace_base = 1;
+            }
+            return 0;
+        }
+        if (snprintf(resolved, resolved_len, "%s", requested) >= (int)resolved_len) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        return 0;
+    }
+    if (!workspace_root || !workspace_root[0]) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (snprintf(resolved, resolved_len, "%s/%s", workspace_root, requested) >=
+        (int)resolved_len) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (used_workspace_base) {
+        *used_workspace_base = 1;
+    }
+    return 0;
+}
+
+static int join_path(char *dst, size_t dst_sz, const char *base, const char *suffix) {
+    if (!dst || dst_sz == 0 || !base || !suffix) {
+        errno = EINVAL;
+        return -1;
+    }
+    size_t base_len = strlen(base);
+    size_t suffix_len = strlen(suffix);
+    if (base_len + suffix_len >= dst_sz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(dst, base, base_len);
+    memcpy(dst + base_len, suffix, suffix_len + 1);
     return 0;
 }
 static void log_event(struct ss_context *ctx, const char *fmt, ...) {
@@ -1367,7 +1497,33 @@ int main(int argc, char **argv) {
     const char *data_port = argv[3];
     const char *nm_host = argv[4];
     const char *nm_port = argv[5];
-    const char *storage_dir = argv[6];
+    const char *requested_storage_dir = argv[6];
+    char workspace_root[PATH_MAX];
+    if (get_workspace_root(workspace_root, sizeof(workspace_root)) < 0) {
+        if (!getcwd(workspace_root, sizeof(workspace_root))) {
+            workspace_root[0] = '\0';
+        }
+    }
+    char storage_dir_buf[PATH_MAX];
+    int used_workspace_base = 0;
+    if (resolve_storage_directory(workspace_root,
+                                  requested_storage_dir,
+                                  storage_dir_buf,
+                                  sizeof(storage_dir_buf),
+                                  &used_workspace_base) < 0) {
+        fprintf(stderr,
+                "Invalid storage directory '%s': %s\n",
+                requested_storage_dir,
+                strerror(errno));
+        return 1;
+    }
+    if (used_workspace_base && path_uses_temp_alias(requested_storage_dir)) {
+        fprintf(stderr,
+                "Redirected storage dir %s -> %s to keep data inside workspace\n",
+                requested_storage_dir,
+                storage_dir_buf);
+    }
+    const char *storage_dir = storage_dir_buf;
 
     struct ss_context ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -1396,20 +1552,22 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    char log_dir[512];
-    snprintf(log_dir, sizeof(log_dir), "%s/logs", storage_dir);
+    char log_dir[PATH_MAX];
+    if (join_path(log_dir, sizeof(log_dir), storage_dir, "/logs") < 0) {
+        fprintf(stderr, "Failed to compose log directory: %s\n", strerror(errno));
+        exit_code = 1;
+        goto cleanup;
+    }
     if (ensure_directory(log_dir) < 0) {
         fprintf(stderr, "Failed to create log directory: %s\n", strerror(errno));
         exit_code = 1;
         goto cleanup;
     }
-    char general_log[512];
-    char request_log[512];
-    if (snprintf(general_log, sizeof(general_log), "%s/ss.log", log_dir) >=
-            (int)sizeof(general_log) ||
-        snprintf(request_log, sizeof(request_log), "%s/requests.log", log_dir) >=
-            (int)sizeof(request_log)) {
-        fprintf(stderr, "Log path too long\n");
+    char general_log[PATH_MAX];
+    char request_log[PATH_MAX];
+    if (join_path(general_log, sizeof(general_log), log_dir, "/ss.log") < 0 ||
+        join_path(request_log, sizeof(request_log), log_dir, "/requests.log") < 0) {
+        fprintf(stderr, "Log path too long: %s\n", strerror(errno));
         exit_code = 1;
         goto cleanup;
     }

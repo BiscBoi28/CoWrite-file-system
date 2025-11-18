@@ -4,3 +4,11 @@
 can connect  as the same client for some  reason
 exit for users should add
 instead of file locking, sentence locking is there
+optimized searching algos for files and sentences
+in info, write down all access rights also
+create then undo kills the user
+
+
+what scripts do they expect us to run for exec? since we can only put scripts which are in a single file only.
+is user b1 is writing to a sentence, if b2 undos that sentence, then that sentence is appended to the end
+does the ss create a temp of the file it is streaming (when i undo or write while streaming then it still streams correctly.)

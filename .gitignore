@@ -9,3 +9,4 @@ nm_state.db
 nm.log
 *.o
 bin/
+tmp/
