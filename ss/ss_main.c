@@ -97,6 +97,7 @@ static char *join_sentences(struct array *sentences);
 static char *load_text(const char *path, size_t *out_size);
 static int store_text_atomic(const char *path, const char *content);
 static size_t count_words_in_text(const char *text);
+static int is_sentence_delim_char(char c);
 static int ss_fetch_remote_content(const char *host,
                                    const char *port,
                                    const char *file,
@@ -411,6 +412,20 @@ static int write_session_apply_insert(struct write_session *session, int index, 
         string_array_clear(&words);
         return -1;
     }
+    size_t inserted_words = new_words.len;
+    int relocate_delim = 0;
+    char delim_char = '\0';
+    if (idx == words.len && words.len > 0) {
+        char *last_word = string_array_get_value(&words, words.len - 1);
+        if (last_word) {
+            size_t last_len = strlen(last_word);
+            if (last_len > 0 && is_sentence_delim_char(last_word[last_len - 1])) {
+                delim_char = last_word[last_len - 1];
+                last_word[last_len - 1] = '\0';
+                relocate_delim = 1;
+            }
+        }
+    }
     for (size_t i = 0; i < new_words.len; ++i) {
         char *w = string_array_get_value(&new_words, i);
         if (string_array_insert(&words, (size_t)(index + i), w) < 0) {
@@ -420,6 +435,32 @@ static int write_session_apply_insert(struct write_session *session, int index, 
         }
     }
     string_array_clear(&new_words);
+    if (relocate_delim) {
+        size_t target_index;
+        if (inserted_words > 0) {
+            target_index = idx + inserted_words - 1;
+        } else {
+            target_index = (words.len > 0) ? (words.len - 1) : 0;
+        }
+        if (target_index < words.len) {
+            char **slot = array_get(&words, target_index);
+            if (!slot || !*slot) {
+                string_array_clear(&words);
+                errno = ENOMEM;
+                return -1;
+            }
+            size_t word_len = strlen(*slot);
+            char *expanded = realloc(*slot, word_len + 2);
+            if (!expanded) {
+                string_array_clear(&words);
+                errno = ENOMEM;
+                return -1;
+            }
+            expanded[word_len] = delim_char;
+            expanded[word_len + 1] = '\0';
+            *slot = expanded;
+        }
+    }
     char *joined = join_words(&words);
     string_array_clear(&words);
     if (!joined) {
@@ -2124,6 +2165,10 @@ static size_t count_words_in_text(const char *text) {
         }
     }
     return count;
+}
+
+static int is_sentence_delim_char(char c) {
+    return (c == '.' || c == '!' || c == '?');
 }
 
 static void sleep_ms(int ms) {

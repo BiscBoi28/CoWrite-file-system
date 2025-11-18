@@ -628,20 +628,62 @@ static int ss_fetch_content(struct storage_server *ss,
     return 0;
 }
 
+static int is_exec_delim_char(char c) {
+    return (c == '.' || c == '!' || c == '?');
+}
+
+static char *flatten_exec_script(const char *script) {
+    if (!script) {
+        return strdup("");
+    }
+    size_t len = strlen(script);
+    char *flat = malloc(len + 1);
+    if (!flat) {
+        return NULL;
+    }
+    size_t pos = 0;
+    char last_non_newline = '\0';
+    for (size_t i = 0; i < len; ++i) {
+        char c = script[i];
+        if (c == '\r') {
+            continue;
+        }
+        if (c == '\n') {
+            if (last_non_newline && is_exec_delim_char(last_non_newline)) {
+                continue;
+            }
+            flat[pos++] = c;
+            continue;
+        }
+        flat[pos++] = c;
+        last_non_newline = c;
+    }
+    flat[pos] = '\0';
+    return flat;
+}
+
 static int run_exec_commands(const char *script, char **output) {
     char template[] = "/tmp/docspp-exec-XXXXXX";
     int fd = mkstemp(template);
     if (fd < 0) {
         return -1;
     }
-    size_t len = strlen(script);
+    char *normalized = flatten_exec_script(script);
+    if (!normalized) {
+        close(fd);
+        unlink(template);
+        return -1;
+    }
+    size_t len = strlen(normalized);
     if (len > 0) {
-        if (write(fd, script, len) != (ssize_t)len) {
+        if (write(fd, normalized, len) != (ssize_t)len) {
+            free(normalized);
             close(fd);
             unlink(template);
             return -1;
         }
     }
+    free(normalized);
     const char newline = '\n';
     if (write(fd, &newline, 1) != 1) {
         close(fd);
