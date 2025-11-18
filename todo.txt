@@ -7,13 +7,13 @@
 ~!(decided to not do) !in info, write down all access rights also
 ~print which files have write and read user access
 ~create then undo kills the user
-threadpooling of exec
+?~threadpooling of exec
+load balancing of servers
 multiple undo fix
-when no backup is there, then it should show the previously active backup as well
+~!(decided not to d) when no backup is there, then it should show the previously active backup as well
 nm gets segfault/dies out of nowhere after running for a while
 optimized searching algos for files and sentences
 run optimization of everything
-threadpooling of exec (do only if time remains)
 
 what scripts do they expect us to run for exec? since we can only put scripts which are in a single file only.
 is user b1 is writing to a sentence, if b2 undos that sentence, then that sentence is appended to the end
