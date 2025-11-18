@@ -1248,7 +1248,7 @@ static int handle_client_undo(struct nm_context *ctx, struct peer *p, const char
     }
     free(response);
     log_request(ctx, "UNDO user=%s file=%s", p->user, file_name);
-    return ok ? 0 : -1;
+    return 0;
 }
 
 static int handle_client_exec(struct nm_context *ctx, struct peer *p, const char *json) {
