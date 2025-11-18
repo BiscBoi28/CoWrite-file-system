@@ -737,8 +737,8 @@ static int perform_undo(struct ss_context *ctx,
         free(current_text);
         return -1;
     }
-    if (store_text_atomic(view.undo_path, current_text) < 0) {
-        log_event(ctx, "Failed to update undo file for %s: %s", file_name, strerror(errno));
+    if (unlink(view.undo_path) < 0) {
+        log_event(ctx, "Failed to delete undo file for %s: %s", file_name, strerror(errno));
     }
     size_t new_chars = strlen(undo_text);
     size_t new_words = count_words_in_text(undo_text);
@@ -1317,30 +1317,23 @@ static int handle_nm_sync(struct ss_context *ctx, const char *json) {
     }
     size_t new_chars = strlen(content);
     size_t new_words = count_words_in_text(content);
-    time_t now = time(NULL);
-    struct ss_file notify_copy;
-    int have_meta = 0;
+    int updated = 0;
     if (pthread_rwlock_wrlock(&ctx->state_lock) == 0) {
         size_t idx = 0;
         struct ss_file *file = ss_state_find(&ctx->state, file_name, &idx);
         if (file) {
             file->char_count = new_chars;
             file->word_count = new_words;
-            file->modified = now;
-            file->last_access = now;
-            snprintf(file->last_access_user, sizeof(file->last_access_user), "%s", owner);
             ss_state_save_meta(&ctx->state, file);
-            notify_copy = *file;
-            have_meta = 1;
+            updated = 1;
         }
         pthread_rwlock_unlock(&ctx->state_lock);
     }
-    if (!have_meta) {
+    if (!updated) {
         free(content);
         return send_error_response(ctx->nm_fd, ERR_INTERNAL, "sync failed");
     }
     log_request(ctx, "SYNC file=%s owner=%s", file_name, owner);
-    notify_nm_file_update(ctx, &notify_copy);
     free(content);
     return send_ok(ctx->nm_fd, "\"op\":\"SYNC\"");
 }
@@ -1428,7 +1421,7 @@ static int process_nm_command(struct ss_context *ctx) {
             size_t undo_words = 0;
             size_t undo_chars = 0;
             if (perform_undo(ctx, file_name, user, &text, &undo_words, &undo_chars) < 0) {
-                send_error_response(ctx->nm_fd, ERR_CONFLICT, "undo failed");
+                send_error_response(ctx->nm_fd, ERR_CONFLICT, "undo not possible");
             } else {
                 char *escaped = json_escape_dup(text);
                 if (escaped) {

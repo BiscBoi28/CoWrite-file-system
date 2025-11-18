@@ -70,12 +70,21 @@ struct ticket_entry {
     int ss_index;
 };
 
+struct replication_task {
+    char file[NM_MAX_NAME];
+    char owner[NM_MAX_USER];
+    int primary_index;
+    int backup_index;
+    int assign_mode;
+};
+
 struct nm_context {
     int listen_fd;
     struct peer peers[MAX_PEERS];
     struct nm_state state;
     struct array tickets; /* struct ticket_entry */
     struct array active_users; /* struct active_user */
+    struct array replication_queue; /* struct replication_task */
     struct log_writer log_general;
     struct log_writer log_requests;
     pthread_mutex_t state_lock;
@@ -84,10 +93,14 @@ struct nm_context {
     pthread_mutex_t peer_lock;
     pthread_mutex_t log_general_lock;
     pthread_mutex_t log_requests_lock;
+    pthread_mutex_t replication_lock;
+    pthread_cond_t replication_cond;
     int locks_ready;
     int shutting_down;
     pthread_t prune_thread;
     int prune_thread_running;
+    pthread_t replication_thread;
+    int replication_thread_running;
 };
 
 static void peer_reset_fields(struct peer *p) {
@@ -167,6 +180,25 @@ static int init_context_locks(struct nm_context *ctx) {
         pthread_mutex_destroy(&ctx->state_lock);
         return -1;
     }
+    if (pthread_mutex_init(&ctx->replication_lock, NULL) != 0) {
+        pthread_mutex_destroy(&ctx->log_requests_lock);
+        pthread_mutex_destroy(&ctx->log_general_lock);
+        pthread_mutex_destroy(&ctx->peer_lock);
+        pthread_mutex_destroy(&ctx->user_lock);
+        pthread_mutex_destroy(&ctx->ticket_lock);
+        pthread_mutex_destroy(&ctx->state_lock);
+        return -1;
+    }
+    if (pthread_cond_init(&ctx->replication_cond, NULL) != 0) {
+        pthread_mutex_destroy(&ctx->replication_lock);
+        pthread_mutex_destroy(&ctx->log_requests_lock);
+        pthread_mutex_destroy(&ctx->log_general_lock);
+        pthread_mutex_destroy(&ctx->peer_lock);
+        pthread_mutex_destroy(&ctx->user_lock);
+        pthread_mutex_destroy(&ctx->ticket_lock);
+        pthread_mutex_destroy(&ctx->state_lock);
+        return -1;
+    }
     ctx->locks_ready = 1;
     return 0;
 }
@@ -179,6 +211,8 @@ static void destroy_context_locks(struct nm_context *ctx) {
         peer_slot_destroy(&ctx->peers[i]);
     }
     pthread_mutex_destroy(&ctx->log_requests_lock);
+    pthread_cond_destroy(&ctx->replication_cond);
+    pthread_mutex_destroy(&ctx->replication_lock);
     pthread_mutex_destroy(&ctx->log_general_lock);
     pthread_mutex_destroy(&ctx->peer_lock);
     pthread_mutex_destroy(&ctx->user_lock);
@@ -313,9 +347,16 @@ static int handle_server_message(struct nm_context *ctx, const char *json);
 static int server_is_available(const struct storage_server *ss);
 static void drop_backup_only(struct nm_context *ctx, struct file_entry *file, const char *reason);
 static void drop_file_backup(struct nm_context *ctx, struct file_entry *file, const char *reason);
-static void try_assign_backup(struct nm_context *ctx, struct file_entry *file);
+static void try_assign_backup(struct nm_context *ctx, const char *file_name);
 static int has_backup_candidate(const struct nm_context *ctx, int primary_index);
 static void *peer_thread_main(void *arg);
+static int schedule_replication(struct nm_context *ctx,
+                                const char *file_name,
+                                const char *owner,
+                                int primary_index,
+                                int backup_index,
+                                int assign_mode);
+static void *replication_worker(void *arg);
 static void *ticket_prune_worker(void *arg);
 static struct peer *find_server_peer(struct nm_context *ctx, int server_index);
 static int obtain_ticket_for_file(struct nm_context *ctx,
@@ -683,11 +724,11 @@ static void handle_server_disconnect(struct nm_context *ctx, struct peer *p) {
     if (p->type == PEER_SERVER && p->server_index >= 0) {
         pthread_mutex_lock(&ctx->state_lock);
         int server_index = p->server_index;
-        STATE_LOCK(ctx);
         nm_mark_server_down(&ctx->state, server_index);
-        STATE_UNLOCK(ctx);
         log_event(ctx, "server %d disconnected", server_index);
         int state_dirty = 0;
+        char pending_backup[NM_MAX_FILES][NM_MAX_NAME];
+        size_t pending_count = 0;
         for (size_t i = 0; i < ctx->state.file_count; ++i) {
             struct file_entry *file = &ctx->state.files[i];
             int file_dirty = 0;
@@ -728,7 +769,11 @@ static void handle_server_disconnect(struct nm_context *ctx, struct peer *p) {
                 state_dirty = 1;
                 if (file->backup_index < 0 && file->ss_index >= 0 &&
                     has_backup_candidate(ctx, file->ss_index)) {
-                    try_assign_backup(ctx, file);
+                    if (pending_count < NM_MAX_FILES) {
+                        strncpy(pending_backup[pending_count], file->name, NM_MAX_NAME - 1);
+                        pending_backup[pending_count][NM_MAX_NAME - 1] = '\0';
+                        pending_count++;
+                    }
                 }
             }
         }
@@ -736,6 +781,9 @@ static void handle_server_disconnect(struct nm_context *ctx, struct peer *p) {
             nm_state_save(&ctx->state);
         }
         pthread_mutex_unlock(&ctx->state_lock);
+        for (size_t i = 0; i < pending_count; ++i) {
+            try_assign_backup(ctx, pending_backup[i]);
+        }
     }
 }
 
@@ -1245,6 +1293,8 @@ static struct storage_server *select_storage_server(struct nm_context *ctx,
             if (server_index_out) {
                 *server_index_out = file->ss_index;
             }
+            log_event(ctx, "select_storage_server primary ok file=%s server=%d",
+                      file->name, file->ss_index);
             return ss;
         } else if (ss && !ss->online) {
             log_event(ctx, "primary offline for file=%s server=%s", file->name, ss->id);
@@ -1263,6 +1313,22 @@ static struct storage_server *select_storage_server(struct nm_context *ctx,
             return backup;
         } else {
             drop_file_backup(ctx, file, "backup offline during selection");
+            log_event(ctx, "select_storage_server backup offline file=%s idx=%d",
+                      file->name, file->backup_index);
+        }
+    }
+    int new_primary = nm_pick_server(&ctx->state);
+    if (new_primary >= 0) {
+        struct storage_server *ss = nm_get_server(&ctx->state, new_primary);
+        if (server_is_available(ss)) {
+            log_event(ctx, "select_storage_server reassign file=%s newPrimary=%s",
+                      file->name, ss->id);
+            file->ss_index = new_primary;
+            if (server_index_out) {
+                *server_index_out = new_primary;
+            }
+            nm_state_save(&ctx->state);
+            return ss;
         }
     }
     return NULL;
@@ -1464,7 +1530,7 @@ static int handle_client_undo(struct nm_context *ctx, struct peer *p, const char
              strcmp(status, "OK") == 0;
     if (!ok) {
         log_event(ctx, "UNDO failure response: %s", response ? response : "<null>");
-        send_error_response(p->fd, ERR_CONFLICT, "undo failed");
+        send_error_response(p->fd, ERR_CONFLICT, "undo not possible");
     } else {
         send_ok(p->fd, "\"op\":\"UNDO\"");
     }
@@ -1570,24 +1636,20 @@ static int handle_client_message(struct nm_context *ctx, struct peer *p, const c
     return send_error_response(p->fd, ERR_BADREQ, "unsupported type");
 }
 
-static int replicate_file_to_backup(struct nm_context *ctx, struct file_entry *file) {
-    if (!file || file->backup_index < 0 || file->ss_index < 0 || file->backup_index == file->ss_index) {
+static int replicate_file_to_backup(struct nm_context *ctx, const char *file_name, const char *owner, int primary_index, int backup_index) {
+    if (!file_name || !owner || primary_index < 0 || backup_index < 0 || primary_index == backup_index) {
         return -1;
     }
-    struct storage_server *primary = nm_get_server(&ctx->state, file->ss_index);
-    struct storage_server *backup = nm_get_server(&ctx->state, file->backup_index);
-    if (!server_is_available(primary)) {
-        log_event(ctx, "BACKUP sync skipped, primary unavailable file=%s", file->name);
-        return -1;
-    }
-    if (!server_is_available(backup)) {
-        drop_file_backup(ctx, file, "backup unavailable before sync");
+    struct storage_server *primary = nm_get_server(&ctx->state, primary_index);
+    struct storage_server *backup = nm_get_server(&ctx->state, backup_index);
+    if (!server_is_available(primary) || !server_is_available(backup)) {
+        log_event(ctx, "BACKUP sync skipped, unavailable server file=%s", file_name);
         return -1;
     }
 
     char ticket[64];
-    if (issue_ticket(ctx, primary, file->ss_index, file->name, file->owner, "READ", ticket) < 0) {
-        log_event(ctx, "BACKUP sync ticket failed file=%s", file->name);
+    if (issue_ticket(ctx, primary, primary_index, file_name, owner, "READ", ticket) < 0) {
+        log_event(ctx, "BACKUP sync ticket failed file=%s", file_name);
         return -1;
     }
 
@@ -1596,8 +1658,8 @@ static int replicate_file_to_backup(struct nm_context *ctx, struct file_entry *f
     char host_esc[256];
     char port_esc[64];
     char ticket_esc[64];
-    if (json_escape_string(file_esc, sizeof(file_esc), file->name) < 0 ||
-        json_escape_string(owner_esc, sizeof(owner_esc), file->owner) < 0 ||
+    if (json_escape_string(file_esc, sizeof(file_esc), file_name) < 0 ||
+        json_escape_string(owner_esc, sizeof(owner_esc), owner) < 0 ||
         json_escape_string(host_esc, sizeof(host_esc), primary->host) < 0 ||
         json_escape_string(port_esc, sizeof(port_esc), primary->data_port) < 0 ||
         json_escape_string(ticket_esc, sizeof(ticket_esc), ticket) < 0) {
@@ -1615,65 +1677,199 @@ static int replicate_file_to_backup(struct nm_context *ctx, struct file_entry *f
     char *response = NULL;
     int rc = forward_command(ctx, backup, payload, &response);
     if (rc < 0) {
-        int failed_index = file->backup_index;
-        drop_file_backup(ctx, file, "backup unreachable during sync");
-        log_event(ctx,
-                  "BACKUP sync unreachable file=%s server=%d",
-                  file->name,
-                  failed_index);
+        log_event(ctx, "BACKUP sync unreachable file=%s server=%d", file_name, backup_index);
         free(response);
         return -1;
     }
     char status[16] = "ERR";
     if (parse_status(response, status, sizeof(status), NULL, 0) < 0 ||
         strcmp(status, "OK") != 0) {
-        int failed_index = file->backup_index;
-        drop_file_backup(ctx, file, "backup sync error");
         log_event(ctx, "BACKUP sync error file=%s server=%d status=%s",
-                  file->name, failed_index, status);
+                  file_name, backup_index, status);
         free(response);
         return -1;
     }
 
-    log_event(ctx, "BACKUP sync succeeded file=%s server=%d", file->name, file->backup_index);
+    log_event(ctx, "BACKUP sync succeeded file=%s server=%d", file_name, backup_index);
     free(response);
     return 0;
 }
 
-static void try_assign_backup(struct nm_context *ctx, struct file_entry *file) {
+static void try_assign_backup(struct nm_context *ctx, const char *file_name) {
+    if (!ctx || !file_name || !file_name[0]) {
+        return;
+    }
+    STATE_LOCK(ctx);
+    struct file_entry *file = nm_find_file(&ctx->state, file_name);
     if (!file || file->backup_index >= 0 || file->ss_index < 0) {
+        STATE_UNLOCK(ctx);
         return;
     }
-    struct storage_server *primary = nm_get_server(&ctx->state, file->ss_index);
-    if (!server_is_available(primary)) {
+    int primary_index = file->ss_index;
+    char owner[NM_MAX_USER];
+    snprintf(owner, sizeof(owner), "%s", file->owner);
+    STATE_UNLOCK(ctx);
+    schedule_replication(ctx, file_name, owner, primary_index, -1, 1);
+}
+
+static int schedule_replication(struct nm_context *ctx,
+                                const char *file_name,
+                                const char *owner,
+                                int primary_index,
+                                int backup_index,
+                                int assign_mode) {
+    if (!ctx || !file_name || !file_name[0] || !owner) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (primary_index < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!assign_mode && backup_index < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct replication_task task;
+    memset(&task, 0, sizeof(task));
+    snprintf(task.file, sizeof(task.file), "%s", file_name);
+    snprintf(task.owner, sizeof(task.owner), "%s", owner);
+    task.primary_index = primary_index;
+    task.backup_index = backup_index;
+    task.assign_mode = assign_mode ? 1 : 0;
+    pthread_mutex_lock(&ctx->replication_lock);
+    for (size_t i = 0; i < ctx->replication_queue.len; ++i) {
+        struct replication_task *existing = array_get(&ctx->replication_queue, i);
+        if (!existing) {
+            continue;
+        }
+        if (strcmp(existing->file, task.file) != 0) {
+            continue;
+        }
+        if (existing->assign_mode && task.assign_mode) {
+            pthread_mutex_unlock(&ctx->replication_lock);
+            return 0;
+        }
+        if (!existing->assign_mode && !task.assign_mode &&
+            existing->primary_index == task.primary_index &&
+            existing->backup_index == task.backup_index) {
+            pthread_mutex_unlock(&ctx->replication_lock);
+            return 0;
+        }
+    }
+    int rc = array_push(&ctx->replication_queue, &task);
+    if (rc == 0) {
+        pthread_cond_signal(&ctx->replication_cond);
+    }
+    pthread_mutex_unlock(&ctx->replication_lock);
+    return rc;
+}
+
+static void handle_replication_failure(struct nm_context *ctx,
+                                       const struct replication_task *task,
+                                       int attempted_backup) {
+    if (!ctx || !task) {
         return;
     }
-    int attempted = 0;
-    for (size_t i = 0; i < ctx->state.server_count; ++i) {
-        if ((int)i == file->ss_index) {
-            continue;
-        }
-        struct storage_server *backup = nm_get_server(&ctx->state, (int)i);
-        if (!server_is_available(backup)) {
-            continue;
-        }
-        attempted = 1;
-        file->backup_index = (int)i;
-        if (replicate_file_to_backup(ctx, file) == 0) {
-            log_event(ctx, "assigned backup file=%s server=%s", file->name, backup->id);
-            nm_state_save(&ctx->state);
-            return;
-        }
-        if (file->backup_index == (int)i) {
-            file->backup_index = -1;
+    int need_assign = task->assign_mode ? 1 : 0;
+    STATE_LOCK(ctx);
+    struct file_entry *file = nm_find_file(&ctx->state, task->file);
+    if (file && !task->assign_mode && file->backup_index == attempted_backup) {
+        drop_file_backup(ctx, file, "backup sync error");
+        if (file->backup_index < 0 && file->ss_index >= 0) {
+            need_assign = 1;
         }
     }
-    if (!attempted) {
-        log_event(ctx, "no backup candidates for file=%s", file->name);
-    } else {
-        log_event(ctx, "failed to assign backup for file=%s", file->name);
+    STATE_UNLOCK(ctx);
+    if (need_assign) {
+        try_assign_backup(ctx, task->file);
     }
-    nm_state_save(&ctx->state);
+}
+
+static void *replication_worker(void *arg) {
+    struct nm_context *ctx = arg;
+    if (!ctx) {
+        return NULL;
+    }
+    while (1) {
+        struct replication_task task;
+        int have_task = 0;
+        pthread_mutex_lock(&ctx->replication_lock);
+        while (!ctx->shutting_down && ctx->replication_queue.len == 0) {
+            pthread_cond_wait(&ctx->replication_cond, &ctx->replication_lock);
+        }
+        if (ctx->shutting_down) {
+            pthread_mutex_unlock(&ctx->replication_lock);
+            break;
+        }
+        struct replication_task *entry = array_get(&ctx->replication_queue, 0);
+        if (entry) {
+            task = *entry;
+            array_remove(&ctx->replication_queue, 0);
+            have_task = 1;
+        }
+        pthread_mutex_unlock(&ctx->replication_lock);
+        if (!have_task) {
+            continue;
+        }
+        char owner[NM_MAX_USER];
+        owner[0] = '\0';
+        int current_primary = -1;
+        STATE_LOCK(ctx);
+        struct file_entry *file = nm_find_file(&ctx->state, task.file);
+        if (file) {
+            current_primary = file->ss_index;
+            snprintf(owner, sizeof(owner), "%s", file->owner);
+        }
+        STATE_UNLOCK(ctx);
+        if (current_primary < 0 || current_primary != task.primary_index) {
+            continue;
+        }
+        if (!task.assign_mode) {
+            STATE_LOCK(ctx);
+            struct file_entry *check = nm_find_file(&ctx->state, task.file);
+            if (!check || check->backup_index != task.backup_index) {
+                STATE_UNLOCK(ctx);
+                continue;
+            }
+            STATE_UNLOCK(ctx);
+        }
+        int target_backup = task.backup_index;
+        if (task.assign_mode) {
+            STATE_LOCK(ctx);
+            target_backup = -1;
+            for (size_t i = 0; i < ctx->state.server_count; ++i) {
+                if ((int)i == current_primary) {
+                    continue;
+                }
+                struct storage_server *candidate = nm_get_server(&ctx->state, (int)i);
+                if (server_is_available(candidate)) {
+                    target_backup = (int)i;
+                    break;
+                }
+            }
+            STATE_UNLOCK(ctx);
+            if (target_backup < 0) {
+                log_event(ctx, "no backup candidates for file=%s", task.file);
+                continue;
+            }
+        }
+        if (replicate_file_to_backup(ctx, task.file, owner, current_primary, target_backup) != 0) {
+            handle_replication_failure(ctx, &task, target_backup);
+            continue;
+        }
+        STATE_LOCK(ctx);
+        struct file_entry *updated = nm_find_file(&ctx->state, task.file);
+        if (updated && updated->ss_index == current_primary) {
+            if (task.assign_mode) {
+                updated->backup_index = target_backup;
+                nm_state_save(&ctx->state);
+                log_event(ctx, "assigned backup file=%s server=%d", task.file, target_backup);
+            }
+        }
+        STATE_UNLOCK(ctx);
+    }
+    return NULL;
 }
 
 static void handle_ss_file_update(struct nm_context *ctx, const char *json) {
@@ -1700,8 +1896,16 @@ static void handle_ss_file_update(struct nm_context *ctx, const char *json) {
     if (json_get_int(json, "lastAccess", &tmp) == 0) {
         last_access = (long)tmp;
     }
+    int need_assign = 0;
+    int need_sync = 0;
+    int primary_index = -1;
+    int backup_index = -1;
+    char owner[NM_MAX_USER];
+    owner[0] = '\0';
+    STATE_LOCK(ctx);
     struct file_entry *file = nm_find_file(&ctx->state, file_name);
     if (!file) {
+        STATE_UNLOCK(ctx);
         return;
     }
     time_t prev_modified = file->modified;
@@ -1713,14 +1917,28 @@ static void handle_ss_file_update(struct nm_context *ctx, const char *json) {
                             (time_t)last_access,
                             last_user);
     nm_state_save(&ctx->state);
-    if (file->modified != prev_modified) {
-        if (file->backup_index >= 0) {
-            replicate_file_to_backup(ctx, file);
-        }
+    snprintf(owner, sizeof(owner), "%s", file->owner);
+    primary_index = file->ss_index;
+    backup_index = file->backup_index;
+    need_sync = (file->modified != prev_modified && backup_index >= 0);
+    if (file->backup_index < 0 && file->ss_index >= 0) {
+        need_assign = has_backup_candidate(ctx, file->ss_index);
     }
-    if (file->backup_index < 0 && file->ss_index >= 0 &&
-        has_backup_candidate(ctx, file->ss_index)) {
-        try_assign_backup(ctx, file);
+    STATE_UNLOCK(ctx);
+    if (need_sync) {
+        if (schedule_replication(ctx, file_name, owner, primary_index, backup_index, 0) < 0) {
+            log_event(ctx, "failed to enqueue replication for file=%s", file_name);
+            struct replication_task failure_task;
+            memset(&failure_task, 0, sizeof(failure_task));
+            snprintf(failure_task.file, sizeof(failure_task.file), "%s", file_name);
+            snprintf(failure_task.owner, sizeof(failure_task.owner), "%s", owner);
+            failure_task.primary_index = primary_index;
+            failure_task.backup_index = backup_index;
+            failure_task.assign_mode = 0;
+            handle_replication_failure(ctx, &failure_task, backup_index);
+        }
+    } else if (need_assign) {
+        schedule_replication(ctx, file_name, owner, primary_index, -1, 1);
     }
 }
 
@@ -1759,7 +1977,7 @@ static int handle_ss_register(struct nm_context *ctx, struct peer *p, const char
         for (size_t i = 0; i < ctx->state.file_count; ++i) {
             struct file_entry *file = &ctx->state.files[i];
             if (file->backup_index < 0) {
-                try_assign_backup(ctx, file);
+        try_assign_backup(ctx, file->name);
             }
         }
     }
@@ -1911,6 +2129,11 @@ static void close_context(struct nm_context *ctx) {
         return;
     }
     ctx->shutting_down = 1;
+    if (ctx->locks_ready) {
+        pthread_mutex_lock(&ctx->replication_lock);
+        pthread_cond_broadcast(&ctx->replication_cond);
+        pthread_mutex_unlock(&ctx->replication_lock);
+    }
     if (ctx->listen_fd >= 0) {
         net_close(ctx->listen_fd);
         ctx->listen_fd = -1;
@@ -1934,8 +2157,13 @@ static void close_context(struct nm_context *ctx) {
         pthread_join(ctx->prune_thread, NULL);
         ctx->prune_thread_running = 0;
     }
+    if (ctx->replication_thread_running) {
+        pthread_join(ctx->replication_thread, NULL);
+        ctx->replication_thread_running = 0;
+    }
     array_free(&ctx->tickets);
     array_free(&ctx->active_users);
+    array_free(&ctx->replication_queue);
     log_close(&ctx->log_general);
     log_close(&ctx->log_requests);
     nm_state_save(&ctx->state);
@@ -1958,6 +2186,7 @@ int main(int argc, char **argv) {
     nm_state_init(&ctx.state, state_path);
     array_init(&ctx.tickets, sizeof(struct ticket_entry));
     array_init(&ctx.active_users, sizeof(struct active_user));
+    array_init(&ctx.replication_queue, sizeof(struct replication_task));
 
     if (init_context_locks(&ctx) < 0) {
         fprintf(stderr, "Failed to initialize NM locks\n");
@@ -2000,6 +2229,11 @@ int main(int argc, char **argv) {
         ctx.prune_thread_running = 1;
     } else {
         log_event(&ctx, "failed to start ticket prune thread");
+    }
+    if (pthread_create(&ctx.replication_thread, NULL, replication_worker, &ctx) == 0) {
+        ctx.replication_thread_running = 1;
+    } else {
+        log_event(&ctx, "failed to start replication worker");
     }
 
     while (!ctx.shutting_down) {

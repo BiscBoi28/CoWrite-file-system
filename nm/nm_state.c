@@ -9,11 +9,51 @@
 #include <string.h>
 #include <unistd.h>
 
+static unsigned long file_hash_name(const char *name) {
+    unsigned long hash = 5381;
+    int c;
+    while ((c = (unsigned char)*name++)) {
+        hash = ((hash << 5) + hash) + (unsigned long)c;
+    }
+    return hash;
+}
+
+static void file_hash_insert(struct nm_state *state, int index) {
+    if (!state || index < 0 || (size_t)index >= state->file_count) {
+        return;
+    }
+    struct file_entry *file = &state->files[index];
+    size_t bucket = file_hash_name(file->name) % NM_FILE_BUCKETS;
+    file->hash_next = state->file_buckets[bucket];
+    state->file_buckets[bucket] = index;
+}
+
+static void file_hash_remove(struct nm_state *state, int index) {
+    if (!state || index < 0 || (size_t)index >= state->file_count) {
+        return;
+    }
+    struct file_entry *file = &state->files[index];
+    size_t bucket = file_hash_name(file->name) % NM_FILE_BUCKETS;
+    int *link = &state->file_buckets[bucket];
+    while (*link >= 0) {
+        if (*link == index) {
+            *link = state->files[index].hash_next;
+            return;
+        }
+        link = &state->files[*link].hash_next;
+    }
+}
+
 static void clear_state(struct nm_state *state) {
     state->server_count = 0;
     state->file_count = 0;
     state->user_count = 0;
     state->cache_count = 0;
+    state->next_primary_index = 0;
+    state->next_backup_index = 0;
+    for (size_t i = 0; i < NM_FILE_BUCKETS; ++i) {
+        state->file_buckets[i] = -1;
+    }
 }
 
 void nm_state_init(struct nm_state *state, const char *persist_path) {
@@ -94,32 +134,53 @@ void nm_mark_server_down(struct nm_state *state, int index) {
     state->servers[index].online = 0;
 }
 
-int nm_pick_server(const struct nm_state *state) {
-    for (size_t i = 0; i < state->server_count; ++i) {
-        if (state->servers[i].ctrl_fd >= 0 && state->servers[i].online) {
-            return (int)i;
+int nm_pick_server(struct nm_state *state) {
+    if (!state || state->server_count == 0) {
+        return -1;
+    }
+    size_t start = state->next_primary_index % state->server_count;
+    for (size_t offset = 0; offset < state->server_count; ++offset) {
+        size_t idx = (start + offset) % state->server_count;
+        struct storage_server *ss = &state->servers[idx];
+        if (ss->ctrl_fd >= 0 && ss->online) {
+            state->next_primary_index = (idx + 1) % state->server_count;
+            return (int)idx;
         }
     }
     return -1;
 }
 
-int nm_pick_backup_server(const struct nm_state *state, int exclude) {
-    for (size_t i = 0; i < state->server_count; ++i) {
-        if ((int)i == exclude) {
+int nm_pick_backup_server(struct nm_state *state, int exclude) {
+    if (!state || state->server_count == 0) {
+        return -1;
+    }
+    size_t start = state->next_backup_index % state->server_count;
+    for (size_t offset = 0; offset < state->server_count; ++offset) {
+        size_t idx = (start + offset) % state->server_count;
+        if ((int)idx == exclude) {
             continue;
         }
-        if (state->servers[i].ctrl_fd >= 0 && state->servers[i].online) {
-            return (int)i;
+        struct storage_server *ss = &state->servers[idx];
+        if (ss->ctrl_fd >= 0 && ss->online) {
+            state->next_backup_index = (idx + 1) % state->server_count;
+            return (int)idx;
         }
     }
     return -1;
 }
 
 static int find_file_index(struct nm_state *state, const char *name) {
-    for (size_t i = 0; i < state->file_count; ++i) {
-        if (strcmp(state->files[i].name, name) == 0) {
-            return (int)i;
+    if (!state || !name) {
+        return -1;
+    }
+    size_t bucket = file_hash_name(name) % NM_FILE_BUCKETS;
+    int idx = state->file_buckets[bucket];
+    while (idx >= 0) {
+        struct file_entry *file = &state->files[idx];
+        if (strcmp(file->name, name) == 0) {
+            return idx;
         }
+        idx = file->hash_next;
     }
     return -1;
 }
@@ -157,7 +218,9 @@ int nm_add_file(struct nm_state *state,
     file->last_access = now;
     snprintf(file->last_access_user, sizeof(file->last_access_user), "%s", owner);
     file->acl_count = 0;
+    file->hash_next = -1;
     state->file_count++;
+    file_hash_insert(state, (int)(state->file_count - 1));
     return 0;
 }
 
@@ -167,8 +230,12 @@ int nm_remove_file(struct nm_state *state, const char *name) {
         errno = ENOENT;
         return -1;
     }
+    file_hash_remove(state, idx);
     if ((size_t)idx != state->file_count - 1) {
+        int last = (int)(state->file_count - 1);
+        file_hash_remove(state, last);
         state->files[idx] = state->files[state->file_count - 1];
+        file_hash_insert(state, idx);
     }
     state->file_count--;
     return 0;
@@ -494,6 +561,7 @@ int nm_state_load(struct nm_state *state) {
             file.last_access = (time_t)last_access;
             file.acl_count = 0;
             state->files[state->file_count++] = file;
+            file_hash_insert(state, (int)(state->file_count - 1));
             current_file = &state->files[state->file_count - 1];
         } else if (strncmp(line, "ACL ", 4) == 0) {
             if (current_file && current_file->acl_count < NM_MAX_ACL) {
