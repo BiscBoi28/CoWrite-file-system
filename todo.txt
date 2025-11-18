@@ -1,13 +1,17 @@
 ~? and ! limiter testing
 ~stream and then close server  to testing
 ~backup primary backup and unkown
-can connect  as the same client for some  reason
-exit for users should add
-instead of file locking, sentence locking is there
-optimized searching algos for files and sentences
+~can connect  as the same client for some  reason
+~exit for users should add
+~instead of file locking, sentence locking is there
 in info, write down all access rights also
 create then undo kills the user
-
+threadpooling of exec
+multiple undo fix
+when no backup is there, then it should show the previously active backup as well
+nm gets segfault/dies out of nowhere after running for a while
+optimized searching algos for files and sentences
+run optimization of everything
 
 what scripts do they expect us to run for exec? since we can only put scripts which are in a single file only.
 is user b1 is writing to a sentence, if b2 undos that sentence, then that sentence is appended to the end
