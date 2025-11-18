@@ -32,3 +32,4 @@ remove new lines in exec (for i in {1..5}; do echo '$i'; done become for i in {1
 5}; do echo '$i'; done)
 
 crash when streaming and client closes
+testing
