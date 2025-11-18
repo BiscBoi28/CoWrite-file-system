@@ -588,6 +588,40 @@ static int json_append(char *buf, size_t buf_size, int *offset, const char *fmt,
     return 0;
 }
 
+static int append_access_array(char *buf,
+                               size_t buf_size,
+                               int *offset,
+                               const char *key,
+                               struct file_entry *file,
+                               int perm) {
+    if (json_append(buf, buf_size, offset, "\"%s\":[", key) < 0) {
+        return -1;
+    }
+    char user_esc[256];
+    if (json_escape_string(user_esc, sizeof(user_esc), file->owner) < 0) {
+        return -1;
+    }
+    if (json_append(buf, buf_size, offset, "\"%s\"", user_esc) < 0) {
+        return -1;
+    }
+    for (size_t i = 0; i < file->acl_count; ++i) {
+        struct file_acl_entry *acl = &file->acl[i];
+        if ((acl->perm & perm) != perm) {
+            continue;
+        }
+        if (json_escape_string(user_esc, sizeof(user_esc), acl->user) < 0) {
+            return -1;
+        }
+        if (json_append(buf, buf_size, offset, ",\"%s\"", user_esc) < 0) {
+            return -1;
+        }
+    }
+    if (json_append(buf, buf_size, offset, "]") < 0) {
+        return -1;
+    }
+    return 0;
+}
+
 static int handle_client_view(struct nm_context *ctx, struct peer *p, const char *json) {
     char flags[8] = "";
     json_get_string(json, "flags", flags, sizeof(flags));
@@ -742,13 +776,19 @@ static int handle_client_info(struct nm_context *ctx, struct peer *p, const char
     json_append(extra, sizeof(extra), &offset,
                 "\"lastAccess\":%ld,\"lastAccessUser\":\"%s\",",
                 (long)file->last_access, last_user_esc);
-    json_append(extra, sizeof(extra), &offset,
-                "\"primaryServer\":\"%s\",\"primaryStatus\":\"%s\","
-                "\"backupServer\":\"%s\",\"backupStatus\":\"%s\"}",
-                primary_id[0] ? primary_id : "",
-                primary_status,
-                backup_id[0] ? backup_id : "",
-                backup_status);
+    if (json_append(extra, sizeof(extra), &offset,
+                    "\"primaryServer\":\"%s\",\"primaryStatus\":\"%s\","\
+                    "\"backupServer\":\"%s\",\"backupStatus\":\"%s\",",
+                    primary_id[0] ? primary_id : "",
+                    primary_status,
+                    backup_id[0] ? backup_id : "",
+                    backup_status) < 0 ||
+        append_access_array(extra, sizeof(extra), &offset, "readAccess", file, NM_PERM_READ) < 0 ||
+        json_append(extra, sizeof(extra), &offset, ",") < 0 ||
+        append_access_array(extra, sizeof(extra), &offset, "writeAccess", file, NM_PERM_WRITE) < 0 ||
+        json_append(extra, sizeof(extra), &offset, "}") < 0) {
+        return send_error_response(p->fd, ERR_INTERNAL, "response too large");
+    }
     if (offset < 0) {
         return send_error_response(p->fd, ERR_INTERNAL, "response too large");
     }

@@ -4,7 +4,8 @@
 ~can connect  as the same client for some  reason
 ~exit for users should add
 ~instead of file locking, sentence locking is there
-in info, write down all access rights also
+~!(decided to not do) !in info, write down all access rights also
+~print which files have write and read user access
 create then undo kills the user
 threadpooling of exec
 multiple undo fix

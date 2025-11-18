@@ -244,6 +244,60 @@ static void describe_server_status(char *buf, size_t buf_len, const char *id, co
     snprintf(buf, buf_len, "unknown");
 }
 
+static void print_access_list(const char *json_block, const char *key, const char *label) {
+    char pattern[64];
+    if (snprintf(pattern, sizeof(pattern), "\"%s\":[", key) >= (int)sizeof(pattern)) {
+        printf("  %s: unknown\n", label);
+        return;
+    }
+    const char *pos = strstr(json_block, pattern);
+    if (!pos) {
+        printf("  %s: unknown\n", label);
+        return;
+    }
+    pos += strlen(pattern);
+    printf("  %s: ", label);
+    int printed = 0;
+    while (*pos && *pos != ']') {
+        if (*pos == '"') {
+            pos++;
+            char name_buf[128];
+            size_t idx = 0;
+            while (*pos) {
+                if (*pos == '\\' && pos[1]) {
+                    if (idx + 1 < sizeof(name_buf)) {
+                        name_buf[idx++] = pos[1];
+                    }
+                    pos += 2;
+                    continue;
+                }
+                if (*pos == '"') {
+                    break;
+                }
+                if (idx + 1 < sizeof(name_buf)) {
+                    name_buf[idx++] = *pos;
+                }
+                pos++;
+            }
+            name_buf[idx] = '\0';
+            if (*pos == '"') {
+                pos++;
+            }
+            if (printed > 0) {
+                printf(", ");
+            }
+            printf("%s", name_buf[0] ? name_buf : "(unknown)");
+            printed++;
+        } else {
+            pos++;
+        }
+    }
+    if (printed == 0) {
+        printf("none");
+    }
+    printf("\n");
+}
+
 static int ss_stream(const char *host, const char *port, const char *file, const char *user, const char *ticket) {
     int fd = net_connect(host, port);
     if (fd < 0) {
@@ -642,9 +696,11 @@ static int handle_info_cmd(int nm_fd, const char *file) {
         return 0;
     }
     size_t len = (size_t)(end - pos + 1);
-    char chunk[512];
-    if (len >= sizeof(chunk)) {
-        len = sizeof(chunk) - 1;
+    char *chunk = malloc(len + 1);
+    if (!chunk) {
+        fprintf(stderr, "Out of memory\n");
+        free(response);
+        return -1;
     }
     memcpy(chunk, pos, len);
     chunk[len] = '\0';
@@ -691,6 +747,9 @@ static int handle_info_cmd(int nm_fd, const char *file) {
     printf("  Last Access: %s by %s\n", last_buf, last_user[0] ? last_user : "unknown");
     printf("  Primary Server: %s\n", primary_display);
     printf("  Backup Server: %s\n", backup_display);
+    print_access_list(chunk, "readAccess", "Read Access");
+    print_access_list(chunk, "writeAccess", "Write Access");
+    free(chunk);
     free(response);
     return 0;
 }
