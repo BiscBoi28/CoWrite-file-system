@@ -19,3 +19,16 @@ shoud we keep getting updates from servers? (if server crashes, then the cache h
 what scripts do they expect us to run for exec? since we can only put scripts which are in a single file only.
 is user b1 is writing to a sentence, if b2 undos that sentence, then that sentence is appended to the end
 does the ss create a temp of the file it is streaming (when i undo or write while streaming then it still streams correctly.)
+
+
+
+
+fixes not done yet:
+a b. I can add at index 2 here
+logs fixing
+capital letter testing
+remove new lines in exec (for i in {1..5}; do echo '$i'; done become for i in {1.
+.
+5}; do echo '$i'; done)
+
+crash when streaming and client closes

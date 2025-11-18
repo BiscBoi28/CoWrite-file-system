@@ -1317,20 +1317,18 @@ static struct storage_server *select_storage_server(struct nm_context *ctx,
                       file->name, file->backup_index);
         }
     }
-    int new_primary = nm_pick_server(&ctx->state);
-    if (new_primary >= 0) {
-        struct storage_server *ss = nm_get_server(&ctx->state, new_primary);
-        if (server_is_available(ss)) {
-            log_event(ctx, "select_storage_server reassign file=%s newPrimary=%s",
-                      file->name, ss->id);
-            file->ss_index = new_primary;
-            if (server_index_out) {
-                *server_index_out = new_primary;
-            }
-            nm_state_save(&ctx->state);
-            return ss;
-        }
-    }
+    /*
+     * If we reach here, neither the primary nor the existing backup is
+     * currently reachable. Do NOT silently remap the file to a different
+     * server because that server would not have the file’s data. Leave the
+     * mapping untouched so callers can surface ERR_UNAVAILABLE and the
+     * replication logic can explicitly reassign once a fresh copy exists.
+     */
+    log_event(ctx,
+              "select_storage_server no replicas online for file=%s (primary=%d, backup=%d)",
+              file->name,
+              file->ss_index,
+              file->backup_index);
     return NULL;
 }
 
