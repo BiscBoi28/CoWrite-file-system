@@ -51,6 +51,7 @@ static void clear_state(struct nm_state *state) {
     state->cache_count = 0;
     state->next_primary_index = 0;
     state->next_backup_index = 0;
+    state->request_count = 0;
     for (size_t i = 0; i < NM_FILE_BUCKETS; ++i) {
         state->file_buckets[i] = -1;
     }
@@ -470,6 +471,16 @@ int nm_state_save(struct nm_state *state) {
         struct user_entry *user = &state->users[i];
         write_line(fp, "USER %s %ld", user->name, (long)user->last_seen);
     }
+    for (size_t i = 0; i < state->request_count; ++i) {
+        struct access_request *req = &state->requests[i];
+        write_line(fp,
+                   "REQ %s %s %s %d %d",
+                   req->file,
+                   req->owner,
+                   req->requester,
+                   req->perm,
+                   req->status);
+    }
     write_line(fp, "END");
     fflush(fp);
     fsync(fileno(fp));
@@ -569,6 +580,21 @@ int nm_state_load(struct nm_state *state) {
                 memset(acl, 0, sizeof(*acl));
                 sscanf(line + 4, "%63s %d", acl->user, &acl->perm);
             }
+        } else if (strncmp(line, "REQ ", 4) == 0) {
+            if (state->request_count < NM_MAX_REQUESTS) {
+                struct access_request *req = &state->requests[state->request_count++];
+                memset(req, 0, sizeof(*req));
+                int perm = 0;
+                int status = 0;
+                if (sscanf(line + 4, "%127s %63s %63s %d %d",
+                           req->file, req->owner, req->requester, &perm, &status) == 5) {
+                    req->perm = perm;
+                    req->status = status;
+                } else {
+                    state->request_count--;
+                }
+            }
+            current_file = NULL;
         } else if (strncmp(line, "USER ", 5) == 0) {
             if (state->user_count < NM_MAX_USERS) {
                 struct user_entry *user = &state->users[state->user_count++];

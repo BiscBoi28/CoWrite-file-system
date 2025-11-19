@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -850,6 +851,41 @@ static int file_has_access(struct file_entry *file, const char *user, int perm) 
     return -1;
 }
 
+static struct access_request *find_access_request(struct nm_state *state,
+                                                 const char *file,
+                                                 const char *requester) {
+    if (!state || !file || !requester) {
+        return NULL;
+    }
+    for (size_t i = 0; i < state->request_count; ++i) {
+        struct access_request *req = &state->requests[i];
+        if (strcmp(req->file, file) == 0 && strcmp(req->requester, requester) == 0) {
+            return req;
+        }
+    }
+    return NULL;
+}
+
+static const char *access_request_status_label(int status) {
+    switch (status) {
+        case NM_REQUEST_PENDING:
+            return "PENDING";
+        case NM_REQUEST_APPROVED:
+            return "APPROVED";
+        case NM_REQUEST_DENIED:
+            return "DENIED";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+static const char *access_request_type_label(int perm) {
+    if (perm & NM_PERM_WRITE) {
+        return "WRITE";
+    }
+    return "READ";
+}
+
 static int json_append(char *buf, size_t buf_size, int *offset, const char *fmt, ...) {
     if (*offset < 0) {
         return -1;
@@ -1529,6 +1565,173 @@ static int handle_client_removeaccess(struct nm_context *ctx, struct peer *p, co
     return send_ok(p->fd, "\"op\":\"REMACCESS\"");
 }
 
+static int handle_client_reqaccess(struct nm_context *ctx, struct peer *p, const char *json) {
+    char file_name[NM_MAX_NAME];
+    char mode[8];
+    if (json_get_string(json, "file", file_name, sizeof(file_name)) < 0 ||
+        json_get_string(json, "mode", mode, sizeof(mode)) < 0) {
+        return send_error_response(p->fd, ERR_BADREQ, "missing fields");
+    }
+    int has_flag = 0;
+    int perm = NM_PERM_READ;
+    if (strchr(mode, 'R') || strchr(mode, 'r')) {
+        has_flag = 1;
+    }
+    if (strchr(mode, 'W') || strchr(mode, 'w')) {
+        perm |= NM_PERM_WRITE;
+        has_flag = 1;
+    }
+    if (!has_flag) {
+        return send_error_response(p->fd, ERR_BADREQ, "invalid mode");
+    }
+    STATE_LOCK(ctx);
+    struct file_entry *file = nm_find_file(&ctx->state, file_name);
+    if (!file) {
+        STATE_UNLOCK(ctx);
+        return send_error_response(p->fd, ERR_NOTFOUND, "file not found");
+    }
+    if (strcmp(file->owner, p->user) == 0) {
+        STATE_UNLOCK(ctx);
+        return send_error_response(p->fd, ERR_CONFLICT, "owner already has access");
+    }
+    if (nm_check_access(&ctx->state, file_name, p->user, perm) == 0) {
+        STATE_UNLOCK(ctx);
+        return send_error_response(p->fd, ERR_CONFLICT, "access already granted");
+    }
+    struct access_request *req = find_access_request(&ctx->state, file_name, p->user);
+    if (!req) {
+        if (ctx->state.request_count >= NM_MAX_REQUESTS) {
+            STATE_UNLOCK(ctx);
+            return send_error_response(p->fd, ERR_INTERNAL, "request limit reached");
+        }
+        req = &ctx->state.requests[ctx->state.request_count++];
+        memset(req, 0, sizeof(*req));
+        snprintf(req->file, sizeof(req->file), "%s", file_name);
+        snprintf(req->requester, sizeof(req->requester), "%s", p->user);
+    }
+    snprintf(req->owner, sizeof(req->owner), "%s", file->owner);
+    req->perm = perm;
+    req->status = NM_REQUEST_PENDING;
+    nm_state_save(&ctx->state);
+    STATE_UNLOCK(ctx);
+    log_request(ctx, "REQACCESS requester=%s file=%s owner=%s mode=%s", p->user, file_name, file->owner, mode);
+    return send_ok(p->fd, "\"op\":\"REQACCESS\"");
+}
+
+static int handle_client_viewreqs(struct nm_context *ctx, struct peer *p, const char *json) {
+    char direction[16];
+    if (json_get_string(json, "direction", direction, sizeof(direction)) < 0) {
+        return send_error_response(p->fd, ERR_BADREQ, "missing direction");
+    }
+    int want_sent = (strcasecmp(direction, "SENT") == 0);
+    int want_received = (strcasecmp(direction, "RECEIVED") == 0);
+    if (!want_sent && !want_received) {
+        return send_error_response(p->fd, ERR_BADREQ, "invalid direction");
+    }
+    char extra[MAX_JSON];
+    int offset = 0;
+    json_append(extra, sizeof(extra), &offset, "\"requests\":[");
+    int first = 1;
+    STATE_LOCK(ctx);
+    for (size_t i = 0; i < ctx->state.request_count; ++i) {
+        struct access_request *req = &ctx->state.requests[i];
+        if (want_sent) {
+            if (strcmp(req->requester, p->user) != 0) {
+                continue;
+            }
+        } else {
+            if (strcmp(req->owner, p->user) != 0 || req->status != NM_REQUEST_PENDING) {
+                continue;
+            }
+        }
+        if (!first) {
+            json_append(extra, sizeof(extra), &offset, ",");
+        }
+        first = 0;
+        char file_esc[256];
+        if (json_escape_string(file_esc, sizeof(file_esc), req->file) < 0) {
+            STATE_UNLOCK(ctx);
+            return send_error_response(p->fd, ERR_INTERNAL, "encoding error");
+        }
+        const char *access = access_request_type_label(req->perm);
+        if (want_sent) {
+            const char *status = access_request_status_label(req->status);
+            if (json_append(extra, sizeof(extra), &offset,
+                            "{\"file\":\"%s\",\"access\":\"%s\",\"status\":\"%s\"}",
+                            file_esc, access, status) < 0) {
+                break;
+            }
+        } else {
+            char user_esc[256];
+            if (json_escape_string(user_esc, sizeof(user_esc), req->requester) < 0) {
+                STATE_UNLOCK(ctx);
+                return send_error_response(p->fd, ERR_INTERNAL, "encoding error");
+            }
+            if (json_append(extra, sizeof(extra), &offset,
+                            "{\"file\":\"%s\",\"access\":\"%s\",\"user\":\"%s\"}",
+                            file_esc, access, user_esc) < 0) {
+                break;
+            }
+        }
+    }
+    json_append(extra, sizeof(extra), &offset, "]");
+    if (offset < 0) {
+        STATE_UNLOCK(ctx);
+        return send_error_response(p->fd, ERR_INTERNAL, "response too large");
+    }
+    STATE_UNLOCK(ctx);
+    log_request(ctx, "VIEWREQS user=%s direction=%s", p->user, direction);
+    return send_ok(p->fd, extra);
+}
+
+static int handle_client_handlereq(struct nm_context *ctx, struct peer *p, const char *json) {
+    char file_name[NM_MAX_NAME];
+    char requester[NM_MAX_USER];
+    char action[16];
+    if (json_get_string(json, "file", file_name, sizeof(file_name)) < 0 ||
+        json_get_string(json, "user", requester, sizeof(requester)) < 0 ||
+        json_get_string(json, "action", action, sizeof(action)) < 0) {
+        return send_error_response(p->fd, ERR_BADREQ, "missing fields");
+    }
+    int approve = (strcasecmp(action, "APPROVE") == 0);
+    int deny = (strcasecmp(action, "DENY") == 0);
+    if (!approve && !deny) {
+        return send_error_response(p->fd, ERR_BADREQ, "invalid action");
+    }
+    STATE_LOCK(ctx);
+    struct file_entry *file = nm_find_file(&ctx->state, file_name);
+    if (!file) {
+        STATE_UNLOCK(ctx);
+        return send_error_response(p->fd, ERR_NOTFOUND, "file not found");
+    }
+    if (strcmp(file->owner, p->user) != 0) {
+        STATE_UNLOCK(ctx);
+        return send_error_response(p->fd, ERR_NOAUTH, "only owner");
+    }
+    struct access_request *req = find_access_request(&ctx->state, file_name, requester);
+    if (!req) {
+        STATE_UNLOCK(ctx);
+        return send_error_response(p->fd, ERR_NOTFOUND, "request not found");
+    }
+    if (req->status != NM_REQUEST_PENDING) {
+        STATE_UNLOCK(ctx);
+        return send_error_response(p->fd, ERR_CONFLICT, "request already handled");
+    }
+    if (approve) {
+        if (nm_grant_access(&ctx->state, file_name, requester, req->perm) < 0) {
+            STATE_UNLOCK(ctx);
+            return send_error_response(p->fd, ERR_INTERNAL, "grant failed");
+        }
+        req->status = NM_REQUEST_APPROVED;
+    } else {
+        req->status = NM_REQUEST_DENIED;
+    }
+    nm_state_save(&ctx->state);
+    STATE_UNLOCK(ctx);
+    log_request(ctx, "HANDLEREQ owner=%s file=%s requester=%s action=%s", p->user, file_name, requester, action);
+    return send_ok(p->fd, "\"op\":\"HANDLEREQ\"");
+}
+
 static int handle_client_undo(struct nm_context *ctx, struct peer *p, const char *json) {
     char file_name[NM_MAX_NAME];
     if (json_get_string(json, "file", file_name, sizeof(file_name)) < 0) {
@@ -1658,6 +1861,15 @@ static int handle_client_message(struct nm_context *ctx, struct peer *p, const c
     }
     if (strcmp(type, "REMACCESS") == 0) {
         return handle_client_removeaccess(ctx, p, json);
+    }
+    if (strcmp(type, "REQACCESS") == 0) {
+        return handle_client_reqaccess(ctx, p, json);
+    }
+    if (strcmp(type, "VIEWREQS") == 0) {
+        return handle_client_viewreqs(ctx, p, json);
+    }
+    if (strcmp(type, "HANDLEREQ") == 0) {
+        return handle_client_handlereq(ctx, p, json);
     }
     if (strcmp(type, "UNDO") == 0) {
         return handle_client_undo(ctx, p, json);

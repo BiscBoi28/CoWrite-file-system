@@ -975,6 +975,174 @@ static int handle_remaccess_cmd(int nm_fd, const char *file, const char *user) {
     return 0;
 }
 
+static int handle_reqaccess_cmd(int nm_fd, const char *file, int write_perm) {
+    char *file_esc = json_escape_dup(file);
+    if (!file_esc) {
+        fprintf(stderr, "Out of memory\n");
+        return -1;
+    }
+    const char *mode = write_perm ? "W" : "R";
+    char *response = NULL;
+    if (nm_call(nm_fd, &response, "REQACCESS", "\"file\":\"%s\",\"mode\":\"%s\"", file_esc, mode) < 0) {
+        fprintf(stderr, "Failed to contact NM\n");
+        free(file_esc);
+        return -1;
+    }
+    free(file_esc);
+    char status[16];
+    if (parse_status(response, status, sizeof(status), NULL, 0) < 0 || strcmp(status, "OK") != 0) {
+        print_error_response(response);
+        free(response);
+        return -1;
+    }
+    printf("Access request submitted.\n");
+    free(response);
+    return 0;
+}
+
+static int handle_viewreqs_cmd(int nm_fd, int sent) {
+    const char *direction = sent ? "SENT" : "RECEIVED";
+    char *response = NULL;
+    if (nm_call(nm_fd, &response, "VIEWREQS", "\"direction\":\"%s\"", direction) < 0) {
+        fprintf(stderr, "Failed to contact NM\n");
+        return -1;
+    }
+    char status[16];
+    if (parse_status(response, status, sizeof(status), NULL, 0) < 0 || strcmp(status, "OK") != 0) {
+        print_error_response(response);
+        free(response);
+        return -1;
+    }
+    printf("%s requests:\n", sent ? "Sent" : "Received");
+    const char *marker = "\"requests\":";
+    const char *block = strstr(response, marker);
+    if (!block) {
+        printf("  none\n");
+        free(response);
+        return 0;
+    }
+    const char *array = strchr(block, '[');
+    if (!array) {
+        printf("  none\n");
+        free(response);
+        return 0;
+    }
+    const char *ptr = array + 1;
+    int printed = 0;
+    while (*ptr) {
+        while (*ptr && (isspace((unsigned char)*ptr) || *ptr == ',')) {
+            ptr++;
+        }
+        if (!*ptr || *ptr == ']') {
+            break;
+        }
+        if (*ptr != '{') {
+            ptr++;
+            continue;
+        }
+        const char *obj_start = ptr;
+        int braces = 0;
+        int in_string = 0;
+        int escape = 0;
+        const char *scan = ptr;
+        const char *obj_end = NULL;
+        while (*scan) {
+            char ch = *scan;
+            if (in_string) {
+                if (escape) {
+                    escape = 0;
+                } else if (ch == '\\') {
+                    escape = 1;
+                } else if (ch == '"') {
+                    in_string = 0;
+                }
+            } else {
+                if (ch == '"') {
+                    in_string = 1;
+                } else if (ch == '{') {
+                    braces++;
+                } else if (ch == '}') {
+                    braces--;
+                    if (braces == 0) {
+                        obj_end = scan;
+                        break;
+                    }
+                }
+            }
+            scan++;
+        }
+        if (!obj_end) {
+            break;
+        }
+        size_t obj_len = (size_t)(obj_end - obj_start + 1);
+        char *object = malloc(obj_len + 1);
+        if (!object) {
+            fprintf(stderr, "Out of memory\n");
+            free(response);
+            return -1;
+        }
+        memcpy(object, obj_start, obj_len);
+        object[obj_len] = '\0';
+        char file_buf[256] = "unknown";
+        char access_buf[64] = "unknown";
+        (void)json_get_string(object, "file", file_buf, sizeof(file_buf));
+        (void)json_get_string(object, "access", access_buf, sizeof(access_buf));
+        if (sent) {
+            char status_buf[64] = "unknown";
+            (void)json_get_string(object, "status", status_buf, sizeof(status_buf));
+            printf("  %s | %s | %s\n", file_buf, access_buf, status_buf);
+            printed++;
+        } else {
+            char user_buf[128] = "unknown";
+            (void)json_get_string(object, "user", user_buf, sizeof(user_buf));
+            printf("  %s | %s | %s\n", file_buf, access_buf, user_buf);
+            printed++;
+        }
+        free(object);
+        ptr = obj_end + 1;
+    }
+    if (!printed) {
+        printf("  none\n");
+    }
+    free(response);
+    return 0;
+}
+
+static int handle_handlereq_cmd(int nm_fd, const char *file, const char *user, const char *action) {
+    char *file_esc = json_escape_dup(file);
+    char *user_esc = json_escape_dup(user);
+    char *action_esc = json_escape_dup(action);
+    if (!file_esc || !user_esc || !action_esc) {
+        fprintf(stderr, "Out of memory\n");
+        free(file_esc);
+        free(user_esc);
+        free(action_esc);
+        return -1;
+    }
+    char *response = NULL;
+    if (nm_call(nm_fd, &response, "HANDLEREQ",
+                "\"file\":\"%s\",\"user\":\"%s\",\"action\":\"%s\"",
+                file_esc, user_esc, action_esc) < 0) {
+        fprintf(stderr, "Failed to contact NM\n");
+        free(file_esc);
+        free(user_esc);
+        free(action_esc);
+        return -1;
+    }
+    free(file_esc);
+    free(user_esc);
+    free(action_esc);
+    char status[16];
+    if (parse_status(response, status, sizeof(status), NULL, 0) < 0 || strcmp(status, "OK") != 0) {
+        print_error_response(response);
+        free(response);
+        return -1;
+    }
+    printf("Request handled.\n");
+    free(response);
+    return 0;
+}
+
 static int handle_undo_cmd(int nm_fd, const char *file) {
     char *file_esc = json_escape_dup(file);
     if (!file_esc) {
@@ -1060,6 +1228,9 @@ static void print_help(void) {
     printf("  ADDACCESS -R|-W <file> <user>\n");
     printf("    legacy: ADDACCESS <file> <user> [rw]\n");
     printf("  REMACCESS <file> <user>\n");
+    printf("  REQACCESS <file> <-R|-W>\n");
+    printf("  VIEWREQS <SENT/RECEIVED>\n");
+    printf("  HANDLEREQ <file> <user> <APPROVE/DENY>\n");
     printf("  UNDO <file>\n");
     printf("  EXEC <file>\n");
     printf("  HELP\n");
@@ -1317,6 +1488,74 @@ int main(int argc, char **argv) {
             }
             while (*user && isspace((unsigned char)*user)) user++;
             handle_remaccess_cmd(nm_fd, file, user);
+            continue;
+        }
+        if (strcmp(cmd, "REQACCESS") == 0) {
+            char *file = strtok_r(NULL, " ", &save);
+            char *mode = strtok_r(NULL, " ", &save);
+            if (!file || !mode) {
+                printf("usage: REQACCESS <file> <-R|-W>\n");
+                continue;
+            }
+            file = trim_spaces(file);
+            char *mode_trim = trim_spaces(mode);
+            if (!file || !*file || !mode_trim || !*mode_trim || mode_trim[0] != '-' ||
+                !(mode_trim[1] == 'R' || mode_trim[1] == 'r' || mode_trim[1] == 'W' ||
+                  mode_trim[1] == 'w') ||
+                mode_trim[2] != '\0') {
+                printf("usage: REQACCESS <file> <-R|-W>\n");
+                continue;
+            }
+            int write_perm = (mode_trim[1] == 'W' || mode_trim[1] == 'w');
+            handle_reqaccess_cmd(nm_fd, file, write_perm);
+            continue;
+        }
+        if (strcmp(cmd, "VIEWREQS") == 0) {
+            char *direction = strtok_r(NULL, " ", &save);
+            if (!direction) {
+                printf("usage: VIEWREQS <SENT/RECEIVED>\n");
+                continue;
+            }
+            direction = trim_spaces(direction);
+            if (!direction || !*direction) {
+                printf("usage: VIEWREQS <SENT/RECEIVED>\n");
+                continue;
+            }
+            if (strcasecmp(direction, "SENT") == 0) {
+                handle_viewreqs_cmd(nm_fd, 1);
+            } else if (strcasecmp(direction, "RECEIVED") == 0) {
+                handle_viewreqs_cmd(nm_fd, 0);
+            } else {
+                printf("usage: VIEWREQS <SENT/RECEIVED>\n");
+            }
+            continue;
+        }
+        if (strcmp(cmd, "HANDLEREQ") == 0) {
+            char *file = strtok_r(NULL, " ", &save);
+            char *user = strtok_r(NULL, " ", &save);
+            char *action = strtok_r(NULL, " ", &save);
+            if (!file || !user || !action) {
+                printf("usage: HANDLEREQ <file> <user> <APPROVE/DENY>\n");
+                continue;
+            }
+            file = trim_spaces(file);
+            user = trim_spaces(user);
+            action = trim_spaces(action);
+            if (!file || !*file || !user || !*user || !action || !*action) {
+                printf("usage: HANDLEREQ <file> <user> <APPROVE/DENY>\n");
+                continue;
+            }
+            if (strcasecmp(action, "APPROVE") != 0 && strcasecmp(action, "DENY") != 0) {
+                printf("usage: HANDLEREQ <file> <user> <APPROVE/DENY>\n");
+                continue;
+            }
+            char action_upper[16];
+            size_t idx = 0;
+            for (; action[idx] && idx < sizeof(action_upper) - 1; ++idx) {
+                action_upper[idx] = (char)toupper((unsigned char)action[idx]);
+            }
+            action_upper[idx] = '\0';
+            handle_handlereq_cmd(nm_fd, file, user, action_upper);
             continue;
         }
         if (strcmp(cmd, "UNDO") == 0) {

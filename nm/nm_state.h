@@ -9,12 +9,16 @@
 #define NM_MAX_USERS 512
 #define NM_MAX_ACL 64
 #define NM_MAX_CACHE 128
+#define NM_MAX_REQUESTS 1024
 #define NM_MAX_NAME 128
 #define NM_MAX_USER 64
 #define NM_FILE_BUCKETS 1024
 
 #define NM_PERM_READ 0x1
 #define NM_PERM_WRITE 0x2
+#define NM_REQUEST_PENDING 0
+#define NM_REQUEST_APPROVED 1
+#define NM_REQUEST_DENIED 2
 
 struct storage_server {
     char id[NM_MAX_NAME];
@@ -57,6 +61,15 @@ struct cache_entry {
     time_t last_used;
 };
 
+struct access_request {
+    char file[NM_MAX_NAME];
+    char owner[NM_MAX_USER];
+    char requester[NM_MAX_USER];
+    int perm;
+    int status;
+};
+
+
 struct nm_state {
     struct storage_server servers[NM_MAX_SERVERS];
     size_t server_count;
@@ -68,6 +81,8 @@ struct nm_state {
     size_t user_count;
     struct cache_entry cache[NM_MAX_CACHE];
     size_t cache_count;
+    struct access_request requests[NM_MAX_REQUESTS];
+    size_t request_count;
     char persist_path[256];
     int file_buckets[NM_FILE_BUCKETS];
 };
