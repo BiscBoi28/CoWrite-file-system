@@ -36,6 +36,9 @@
 #define STATE_LOCK(ctx) pthread_mutex_lock(&(ctx)->state_lock)
 #define STATE_UNLOCK(ctx) pthread_mutex_unlock(&(ctx)->state_lock)
 
+struct nm_context;
+static struct nm_context *g_nm_ctx = NULL;
+
 enum peer_type {
     PEER_UNUSED = 0,
     PEER_UNKNOWN,
@@ -314,13 +317,15 @@ static int send_ok(int fd, const char *extra) {
 
 static int send_error_response(int fd, error_code_t code, const char *message) {
     char buf[MAX_JSON];
-    if (!message) {
-        message = error_code_message(code);
-    }
+    const char *msg = message ? message : error_code_message(code);
     if (snprintf(buf, sizeof(buf),
                  "{\"status\":\"ERR\",\"code\":\"%s\",\"message\":\"%s\"}",
-                 error_code_name(code), message) >= (int)sizeof(buf)) {
+                 error_code_name(code), msg) >= (int)sizeof(buf)) {
         return -1;
+    }
+    if (g_nm_ctx) {
+        log_event(g_nm_ctx, "ERROR_RESP fd=%d code=%s message=%s",
+                  fd, error_code_name(code), msg);
     }
     return net_send_json(fd, buf);
 }
@@ -2284,7 +2289,7 @@ static int replicate_file_to_backup(struct nm_context *ctx, const char *file_nam
     struct storage_server *primary = nm_get_server(&ctx->state, primary_index);
     struct storage_server *backup = nm_get_server(&ctx->state, backup_index);
     if (!server_is_available(primary) || !server_is_available(backup)) {
-        log_event(ctx, "BACKUP sync skipped, unavailable server file=%s", file_name);
+        // log_event(ctx, "BACKUP sync skipped, unavailable server file=%s", file_name);
         return -1;
     }
 
@@ -2845,6 +2850,8 @@ int main(int argc, char **argv) {
         exit_code = 1;
         goto cleanup;
     }
+
+    g_nm_ctx = ctx;
 
     if (init_context_locks(ctx) < 0) {
         fprintf(stderr, "Failed to initialize NM locks\n");

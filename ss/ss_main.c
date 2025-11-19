@@ -581,6 +581,31 @@ static int append_sentence_list(struct array *dest, struct array *src) {
     return 0;
 }
 
+#define CONTEXT_MATCH_LIMIT 4
+
+static int count_context_matches(const struct array *latest,
+                                 const struct array *original,
+                                 int candidate_index,
+                                 int target_index,
+                                 int direction) {
+    int matches = 0;
+    for (int step = 1; step <= CONTEXT_MATCH_LIMIT; ++step) {
+        int orig_idx = target_index + direction * step;
+        int latest_idx = candidate_index + direction * step;
+        if (orig_idx < 0 || orig_idx >= (int)original->len ||
+            latest_idx < 0 || latest_idx >= (int)latest->len) {
+            break;
+        }
+        char *orig_val = string_array_get_value((struct array *)original, (size_t)orig_idx);
+        char *latest_val = string_array_get_value((struct array *)latest, (size_t)latest_idx);
+        if (!orig_val || !latest_val || strcmp(orig_val, latest_val) != 0) {
+            break;
+        }
+        matches++;
+    }
+    return matches;
+}
+
 static int write_session_commit(struct write_session *session,
                                 const struct ss_file *file,
                                 char **out_text,
@@ -615,22 +640,34 @@ static int write_session_commit(struct write_session *session,
         insert_index = (int)latest_sentences.len;
     }
 
-    int matched_index = -1;
     const int replacing_existing = (session->baseline_sentence && session->baseline_sentence[0]);
     if (replacing_existing) {
+        int best_index = -1;
+        int best_score = INT_MIN;
         for (size_t i = 0; i < latest_sentences.len; ++i) {
             char *candidate = string_array_get_value(&latest_sentences, i);
-            if (strcmp(candidate, session->baseline_sentence) == 0) {
-                matched_index = (int)i;
-                if ((int)i >= session->sentence_index) {
-                    insert_index = (int)i;
-                    break;
-                }
-                insert_index = (int)i;
+            if (!candidate || strcmp(candidate, session->baseline_sentence) != 0) {
+                continue;
+            }
+            int prefix_matches = count_context_matches(&latest_sentences, &session->sentences,
+                                                       (int)i, session->sentence_index, -1);
+            int suffix_matches = count_context_matches(&latest_sentences, &session->sentences,
+                                                       (int)i, session->sentence_index, 1);
+            int distance = abs((int)i - session->sentence_index);
+            int score = prefix_matches * 1000 + suffix_matches * 500 - distance * 10;
+            if ((int)i < session->sentence_index) {
+                score -= 50;
+            }
+            if (score > best_score) {
+                best_score = score;
+                best_index = (int)i;
             }
         }
-        if (matched_index >= 0) {
-            insert_index = matched_index;
+        if (best_index >= 0) {
+            insert_index = best_index;
+        } else {
+            errno = EAGAIN;
+            goto commit_fail;
         }
     }
     if (insert_index > (int)latest_sentences.len) {
@@ -638,7 +675,9 @@ static int write_session_commit(struct write_session *session,
     }
 
     struct array merged;
+    int merged_init = 0;
     string_array_init(&merged);
+    merged_init = 1;
     int inserted = 0;
     int removed_original = 0;
     for (size_t i = 0; i < latest_sentences.len; ++i) {
@@ -702,7 +741,9 @@ static int write_session_commit(struct write_session *session,
     return 0;
 
 commit_fail:
-    string_array_clear(&merged);
+    if (merged_init) {
+        string_array_clear(&merged);
+    }
     string_array_clear(&new_parts);
     string_array_clear(&latest_sentences);
     free(current_text);
@@ -1138,7 +1179,12 @@ static int handle_write(struct ss_context *ctx,
             size_t new_words = 0;
             size_t new_chars = 0;
             if (write_session_commit(&session, &view, &final_text, &new_words, &new_chars) < 0) {
-                send_error_response(client_fd, ERR_INTERNAL, "commit failed");
+                int commit_err = errno;
+                if (commit_err == EAGAIN) {
+                    send_error_response(client_fd, ERR_CONFLICT, "sentence modified by another writer");
+                } else {
+                    send_error_response(client_fd, ERR_INTERNAL, "commit failed");
+                }
             } else {
                 char *escaped_final = json_escape_dup(final_text);
                 if (escaped_final) {
