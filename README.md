@@ -14,7 +14,7 @@ All binaries live under `bin/` after building.
 
 ## Build & Setup
 
-1. **Requirements**: GCC (or Clang), POSIX environment, `make`, and Python 3 for the optional tests.
+1. **Requirements**: GCC (or Clang), POSIX environment, `make`tests.
 2. **Build** everything:
    ```sh
    make
@@ -114,3 +114,7 @@ bin/docs_client <nm_host> <nm_port> [preferred_ss_port]
 | `ERR_TIMEOUT` | Ticket expired or operation timed out.
 
 These identifiers match the `code` field in every JSON error reply and what NM logs under `ERROR_RESP`, so you can trace failures end-to-end.
+
+# Novelty Points
+- Added threads for each server and client on nm (nothing is blocking any other process/connection)
+- Functionality to crash ss when client closes abruptly while streaming is going on (to simulate erratic crashes)
