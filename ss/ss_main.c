@@ -822,6 +822,16 @@ static int perform_undo(struct ss_context *ctx,
         errno = ENOENT;
         return -1;
     }
+    if (view.lock_active) {
+        const char *locker = view.lock_user[0] ? view.lock_user : "<unknown>";
+        log_event(ctx,
+                  "UNDO blocked file=%s locked by %s sentence=%d",
+                  file_name,
+                  locker,
+                  view.lock_sentence);
+        errno = EBUSY;
+        return -1;
+    }
     char *undo_text = load_text(view.undo_path, NULL);
     if (!undo_text) {
         errno = ENOENT;
@@ -1590,6 +1600,17 @@ static int ss_revert_checkpoint(struct ss_context *ctx,
         free(checkpoint);
         return -1;
     }
+    if (view.lock_active) {
+        const char *locker = view.lock_user[0] ? view.lock_user : "<unknown>";
+        log_event(ctx,
+                  "REVERT blocked file=%s locked by %s sentence=%d",
+                  file_name,
+                  locker,
+                  view.lock_sentence);
+        free(checkpoint);
+        errno = EBUSY;
+        return -1;
+    }
     char *current = load_text(view.data_path, NULL);
     if (!current) {
         current = strdup("");
@@ -1689,12 +1710,37 @@ static int process_nm_command(struct ss_context *ctx) {
             send_error_response(ctx->nm_fd, ERR_BADREQ, "invalid delete");
         } else {
             int rc = -1;
+            int not_found = 0;
+            int locked = 0;
+            char locker[SS_USER_MAX];
+            int lock_sentence = -1;
+            locker[0] = '\0';
             if (pthread_rwlock_wrlock(&ctx->state_lock) == 0) {
-                rc = ss_state_remove(&ctx->state, name);
+                size_t idx = 0;
+                struct ss_file *file = ss_state_find(&ctx->state, name, &idx);
+                if (!file) {
+                    not_found = 1;
+                } else if (file->lock_active) {
+                    locked = 1;
+                    lock_sentence = file->lock_sentence;
+                    snprintf(locker, sizeof(locker), "%s", file->lock_user);
+                } else {
+                    rc = ss_state_remove(&ctx->state, name);
+                }
                 pthread_rwlock_unlock(&ctx->state_lock);
             }
-            if (rc < 0) {
-                send_error_response(ctx->nm_fd, ERR_NOTFOUND, "file missing");
+            if (locked) {
+                const char *holder = locker[0] ? locker : "<unknown>";
+                log_event(ctx,
+                          "DELETE blocked file=%s locked by %s sentence=%d",
+                          name,
+                          holder,
+                          lock_sentence);
+                send_error_response(ctx->nm_fd, ERR_LOCKED, "file locked for write");
+            } else if (not_found || rc < 0) {
+                error_code_t code = not_found ? ERR_NOTFOUND : ERR_INTERNAL;
+                const char *msg = not_found ? "file missing" : "delete failed";
+                send_error_response(ctx->nm_fd, code, msg);
             } else {
                 send_ok(ctx->nm_fd, "\"op\":\"DELETE\"");
             }
@@ -1712,7 +1758,11 @@ static int process_nm_command(struct ss_context *ctx) {
             size_t undo_words = 0;
             size_t undo_chars = 0;
             if (perform_undo(ctx, file_name, user, &text, &undo_words, &undo_chars) < 0) {
-                send_error_response(ctx->nm_fd, ERR_CONFLICT, "undo not possible");
+                if (errno == EBUSY) {
+                    send_error_response(ctx->nm_fd, ERR_LOCKED, "file locked for write");
+                } else {
+                    send_error_response(ctx->nm_fd, ERR_CONFLICT, "undo not possible");
+                }
             } else {
                 char *escaped = json_escape_dup(text);
                 if (escaped) {
@@ -1790,7 +1840,11 @@ static int process_nm_command(struct ss_context *ctx) {
         } else if (!valid_filename(tag)) {
             send_error_response(ctx->nm_fd, ERR_BADREQ, "invalid tag");
         } else if (ss_revert_checkpoint(ctx, file_name, tag, user) < 0) {
-            respond_checkpoint_error(ctx, errno, "checkpoint revert failed");
+            if (errno == EBUSY) {
+                send_error_response(ctx->nm_fd, ERR_LOCKED, "file locked for write");
+            } else {
+                respond_checkpoint_error(ctx, errno, "checkpoint revert failed");
+            }
         } else {
             send_ok(ctx->nm_fd, "\"op\":\"REVERT\"");
         }
