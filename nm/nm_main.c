@@ -851,6 +851,42 @@ static int file_has_access(struct file_entry *file, const char *user, int perm) 
     return -1;
 }
 
+static int valid_checkpoint_tag(const char *tag) {
+    if (!tag || !tag[0]) {
+        return 0;
+    }
+    for (const unsigned char *p = (const unsigned char *)tag; *p; ++p) {
+        if (*p == '.' && (p == (const unsigned char *)tag || *(p + 1) == '.')) {
+            return 0;
+        }
+        if (*p == '/' || *p == '\\') {
+            return 0;
+        }
+        if (*p < 32 || *p > 126) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int forward_to_available_server(struct nm_context *ctx,
+                                       struct storage_server *primary,
+                                       struct storage_server *backup,
+                                       const char *payload,
+                                       char **response_out) {
+    if (primary && primary->ctrl_fd >= 0) {
+        if (forward_command(ctx, primary, payload, response_out) == 0) {
+            return 0;
+        }
+    }
+    if (backup && backup != primary && backup->ctrl_fd >= 0) {
+        if (forward_command(ctx, backup, payload, response_out) == 0) {
+            return 0;
+        }
+    }
+    return -1;
+}
+
 static struct access_request *find_access_request(struct nm_state *state,
                                                  const char *file,
                                                  const char *requester) {
@@ -1827,6 +1863,347 @@ static int handle_client_exec(struct nm_context *ctx, struct peer *p, const char
     return send_ok(p->fd, extra);
 }
 
+static int handle_client_checkpoint(struct nm_context *ctx, struct peer *p, const char *json) {
+    char file_name[NM_MAX_NAME];
+    char tag[NM_MAX_NAME];
+    if (json_get_string(json, "file", file_name, sizeof(file_name)) < 0 ||
+        json_get_string(json, "tag", tag, sizeof(tag)) < 0) {
+        return send_error_response(p->fd, ERR_BADREQ, "missing fields");
+    }
+    if (!valid_checkpoint_tag(tag)) {
+        return send_error_response(p->fd, ERR_BADREQ, "invalid tag");
+    }
+    STATE_LOCK(ctx);
+    struct file_entry *file = nm_find_file(&ctx->state, file_name);
+    if (!file) {
+        STATE_UNLOCK(ctx);
+        return send_error_response(p->fd, ERR_NOTFOUND, "file not found");
+    }
+    if (file_has_access(file, p->user, NM_PERM_WRITE) != 0) {
+        STATE_UNLOCK(ctx);
+        return send_error_response(p->fd, ERR_NOAUTH, "no write access");
+    }
+    if (nm_file_find_checkpoint(file, tag)) {
+        STATE_UNLOCK(ctx);
+        return send_error_response(p->fd, ERR_EXISTS, "checkpoint exists");
+    }
+    int primary_index = file->ss_index;
+    int backup_index = file->backup_index;
+    STATE_UNLOCK(ctx);
+
+    if (primary_index < 0) {
+        return send_error_response(p->fd, ERR_UNAVAILABLE, "primary offline");
+    }
+    struct storage_server *primary = nm_get_server(&ctx->state, primary_index);
+    if (!primary || primary->ctrl_fd < 0) {
+        return send_error_response(p->fd, ERR_UNAVAILABLE, "primary offline");
+    }
+
+    char file_esc[NM_MAX_NAME * 2];
+    char tag_esc[NM_MAX_NAME * 2];
+    char user_esc[NM_MAX_USER * 2];
+    if (json_escape_string(file_esc, sizeof(file_esc), file_name) < 0 ||
+        json_escape_string(tag_esc, sizeof(tag_esc), tag) < 0 ||
+        json_escape_string(user_esc, sizeof(user_esc), p->user) < 0) {
+        return send_error_response(p->fd, ERR_INTERNAL, "encoding error");
+    }
+    char payload[MAX_JSON];
+    if (snprintf(payload, sizeof(payload),
+                 "{\"type\":\"NM_CHECKPOINT_CREATE\",\"file\":\"%s\",\"tag\":\"%s\",\"user\":\"%s\"}",
+                 file_esc, tag_esc, user_esc) >= (int)sizeof(payload)) {
+        return send_error_response(p->fd, ERR_INTERNAL, "payload too large");
+    }
+
+    char *response = NULL;
+    if (forward_command(ctx, primary, payload, &response) < 0) {
+        free(response);
+        return send_error_response(p->fd, ERR_UNAVAILABLE, "primary unreachable");
+    }
+    char status[16];
+    if (json_get_string(response, "status", status, sizeof(status)) < 0 || strcmp(status, "OK") != 0) {
+        log_event(ctx, "CHECKPOINT primary failed file=%s status=%s",
+                  file_name, status[0] ? status : "unknown");
+        free(response);
+        return send_error_response(p->fd, ERR_INTERNAL, "checkpoint failed");
+    }
+    free(response);
+
+    STATE_LOCK(ctx);
+    file = nm_find_file(&ctx->state, file_name);
+    if (!file) {
+        STATE_UNLOCK(ctx);
+        return send_error_response(p->fd, ERR_NOTFOUND, "file missing");
+    }
+    if (nm_file_find_checkpoint(file, tag)) {
+        STATE_UNLOCK(ctx);
+        return send_error_response(p->fd, ERR_EXISTS, "checkpoint exists");
+    }
+    time_t now = time(NULL);
+    if (nm_file_add_checkpoint(&ctx->state, file_name, tag, p->user, now) < 0) {
+        int err = errno;
+        STATE_UNLOCK(ctx);
+        if (err == ENOSPC) {
+            return send_error_response(p->fd, ERR_INTERNAL, "checkpoint limit reached");
+        }
+        return send_error_response(p->fd, ERR_INTERNAL, "checkpoint metadata failed");
+    }
+    nm_state_save(&ctx->state);
+    STATE_UNLOCK(ctx);
+
+    log_request(ctx, "CHECKPOINT user=%s file=%s tag=%s", p->user, file_name, tag);
+
+    if (backup_index >= 0) {
+        struct storage_server *backup = nm_get_server(&ctx->state, backup_index);
+        if (backup && backup != primary && backup->ctrl_fd >= 0) {
+            char *backup_resp = NULL;
+            if (forward_command(ctx, backup, payload, &backup_resp) < 0) {
+                log_event(ctx, "CHECKPOINT backup unreachable file=%s server=%s", file_name, backup->id);
+            } else {
+                char backup_status[16];
+                if (json_get_string(backup_resp, "status", backup_status, sizeof(backup_status)) < 0 ||
+                    strcmp(backup_status, "OK") != 0) {
+                    log_event(ctx, "CHECKPOINT backup failed file=%s server=%s status=%s",
+                              file_name, backup->id,
+                              backup_status[0] ? backup_status : "unknown");
+                }
+                free(backup_resp);
+            }
+        }
+    }
+
+    return send_ok(p->fd, "\"op\":\"CHECKPOINT\"");
+}
+
+static int handle_client_viewcheckpoint(struct nm_context *ctx, struct peer *p, const char *json) {
+    char file_name[NM_MAX_NAME];
+    char tag[NM_MAX_NAME];
+    if (json_get_string(json, "file", file_name, sizeof(file_name)) < 0 ||
+        json_get_string(json, "tag", tag, sizeof(tag)) < 0) {
+        return send_error_response(p->fd, ERR_BADREQ, "missing fields");
+    }
+    if (!valid_checkpoint_tag(tag)) {
+        return send_error_response(p->fd, ERR_BADREQ, "invalid tag");
+    }
+    STATE_LOCK(ctx);
+    struct file_entry *file = nm_find_file(&ctx->state, file_name);
+    if (!file) {
+        STATE_UNLOCK(ctx);
+        return send_error_response(p->fd, ERR_NOTFOUND, "file not found");
+    }
+    if (file_has_access(file, p->user, NM_PERM_READ) != 0) {
+        STATE_UNLOCK(ctx);
+        return send_error_response(p->fd, ERR_NOAUTH, "no read access");
+    }
+    if (!nm_file_find_checkpoint(file, tag)) {
+        STATE_UNLOCK(ctx);
+        return send_error_response(p->fd, ERR_NOTFOUND, "checkpoint not found");
+    }
+    int primary_index = file->ss_index;
+    int backup_index = file->backup_index;
+    STATE_UNLOCK(ctx);
+
+    struct storage_server *primary = (primary_index >= 0) ? nm_get_server(&ctx->state, primary_index) : NULL;
+    struct storage_server *backup = (backup_index >= 0) ? nm_get_server(&ctx->state, backup_index) : NULL;
+    if (!primary && !backup) {
+        return send_error_response(p->fd, ERR_UNAVAILABLE, "no storage available");
+    }
+
+    char file_esc[NM_MAX_NAME * 2];
+    char tag_esc[NM_MAX_NAME * 2];
+    char user_esc[NM_MAX_USER * 2];
+    if (json_escape_string(file_esc, sizeof(file_esc), file_name) < 0 ||
+        json_escape_string(tag_esc, sizeof(tag_esc), tag) < 0 ||
+        json_escape_string(user_esc, sizeof(user_esc), p->user) < 0) {
+        return send_error_response(p->fd, ERR_INTERNAL, "encoding error");
+    }
+    char payload[MAX_JSON];
+    if (snprintf(payload, sizeof(payload),
+                 "{\"type\":\"NM_CHECKPOINT_VIEW\",\"file\":\"%s\",\"tag\":\"%s\",\"user\":\"%s\"}",
+                 file_esc, tag_esc, user_esc) >= (int)sizeof(payload)) {
+        return send_error_response(p->fd, ERR_INTERNAL, "payload too large");
+    }
+
+    char *response = NULL;
+    if (forward_to_available_server(ctx, primary, backup, payload, &response) < 0) {
+        free(response);
+        return send_error_response(p->fd, ERR_UNAVAILABLE, "checkpoint unavailable");
+    }
+    char status[16];
+    if (json_get_string(response, "status", status, sizeof(status)) < 0 || strcmp(status, "OK") != 0) {
+        free(response);
+        return send_error_response(p->fd, ERR_INTERNAL, "checkpoint view failed");
+    }
+    char *content = NULL;
+    if (json_get_string_alloc(response, "content", &content) < 0) {
+        free(response);
+        return send_error_response(p->fd, ERR_INTERNAL, "missing content");
+    }
+    free(response);
+
+    char *escaped = json_escape_dup(content);
+    free(content);
+    if (!escaped) {
+        return send_error_response(p->fd, ERR_INTERNAL, "encoding error");
+    }
+    char extra[MAX_JSON];
+    if (snprintf(extra, sizeof(extra), "\"content\":\"%s\"", escaped) >= (int)sizeof(extra)) {
+        free(escaped);
+        return send_error_response(p->fd, ERR_INTERNAL, "response too large");
+    }
+    free(escaped);
+    log_request(ctx, "VIEWCHECKPOINT user=%s file=%s tag=%s", p->user, file_name, tag);
+    return send_ok(p->fd, extra);
+}
+
+static int handle_client_revert(struct nm_context *ctx, struct peer *p, const char *json) {
+    char file_name[NM_MAX_NAME];
+    char tag[NM_MAX_NAME];
+    if (json_get_string(json, "file", file_name, sizeof(file_name)) < 0 ||
+        json_get_string(json, "tag", tag, sizeof(tag)) < 0) {
+        return send_error_response(p->fd, ERR_BADREQ, "missing fields");
+    }
+    if (!valid_checkpoint_tag(tag)) {
+        return send_error_response(p->fd, ERR_BADREQ, "invalid tag");
+    }
+    STATE_LOCK(ctx);
+    struct file_entry *file = nm_find_file(&ctx->state, file_name);
+    if (!file) {
+        STATE_UNLOCK(ctx);
+        return send_error_response(p->fd, ERR_NOTFOUND, "file not found");
+    }
+    if (file_has_access(file, p->user, NM_PERM_WRITE) != 0) {
+        STATE_UNLOCK(ctx);
+        return send_error_response(p->fd, ERR_NOAUTH, "no write access");
+    }
+    if (!nm_file_find_checkpoint(file, tag)) {
+        STATE_UNLOCK(ctx);
+        return send_error_response(p->fd, ERR_NOTFOUND, "checkpoint not found");
+    }
+    int primary_index = file->ss_index;
+    int backup_index = file->backup_index;
+    STATE_UNLOCK(ctx);
+
+    if (primary_index < 0) {
+        return send_error_response(p->fd, ERR_UNAVAILABLE, "primary offline");
+    }
+    struct storage_server *primary = nm_get_server(&ctx->state, primary_index);
+    if (!primary || primary->ctrl_fd < 0) {
+        return send_error_response(p->fd, ERR_UNAVAILABLE, "primary offline");
+    }
+
+    char file_esc[NM_MAX_NAME * 2];
+    char tag_esc[NM_MAX_NAME * 2];
+    char user_esc[NM_MAX_USER * 2];
+    if (json_escape_string(file_esc, sizeof(file_esc), file_name) < 0 ||
+        json_escape_string(tag_esc, sizeof(tag_esc), tag) < 0 ||
+        json_escape_string(user_esc, sizeof(user_esc), p->user) < 0) {
+        return send_error_response(p->fd, ERR_INTERNAL, "encoding error");
+    }
+    char payload[MAX_JSON];
+    if (snprintf(payload, sizeof(payload),
+                 "{\"type\":\"NM_CHECKPOINT_REVERT\",\"file\":\"%s\",\"tag\":\"%s\",\"user\":\"%s\"}",
+                 file_esc, tag_esc, user_esc) >= (int)sizeof(payload)) {
+        return send_error_response(p->fd, ERR_INTERNAL, "payload too large");
+    }
+
+    char *response = NULL;
+    if (forward_command(ctx, primary, payload, &response) < 0) {
+        free(response);
+        return send_error_response(p->fd, ERR_UNAVAILABLE, "primary unreachable");
+    }
+    char status[16];
+    if (json_get_string(response, "status", status, sizeof(status)) < 0 || strcmp(status, "OK") != 0) {
+        log_event(ctx, "REVERT primary failed file=%s status=%s", file_name, status[0] ? status : "unknown");
+        free(response);
+        return send_error_response(p->fd, ERR_INTERNAL, "revert failed");
+    }
+    free(response);
+
+    if (backup_index >= 0) {
+        struct storage_server *backup = nm_get_server(&ctx->state, backup_index);
+        if (backup && backup != primary && backup->ctrl_fd >= 0) {
+            char *backup_resp = NULL;
+            if (forward_command(ctx, backup, payload, &backup_resp) < 0) {
+                log_event(ctx, "REVERT backup unreachable file=%s server=%s", file_name, backup->id);
+            } else {
+                char backup_status[16];
+                if (json_get_string(backup_resp, "status", backup_status, sizeof(backup_status)) < 0 ||
+                    strcmp(backup_status, "OK") != 0) {
+                    log_event(ctx, "REVERT backup failed file=%s server=%s status=%s",
+                              file_name, backup->id,
+                              backup_status[0] ? backup_status : "unknown");
+                }
+                free(backup_resp);
+            }
+        }
+    }
+
+    log_request(ctx, "REVERT user=%s file=%s tag=%s", p->user, file_name, tag);
+    return send_ok(p->fd, "\"op\":\"REVERT\"");
+}
+
+static int handle_client_listcheckpoints(struct nm_context *ctx, struct peer *p, const char *json) {
+    char file_name[NM_MAX_NAME];
+    if (json_get_string(json, "file", file_name, sizeof(file_name)) < 0) {
+        return send_error_response(p->fd, ERR_BADREQ, "missing file");
+    }
+    STATE_LOCK(ctx);
+    struct file_entry *file = nm_find_file(&ctx->state, file_name);
+    if (!file) {
+        STATE_UNLOCK(ctx);
+        return send_error_response(p->fd, ERR_NOTFOUND, "file not found");
+    }
+    if (file_has_access(file, p->user, NM_PERM_READ) != 0) {
+        STATE_UNLOCK(ctx);
+        return send_error_response(p->fd, ERR_NOAUTH, "no read access");
+    }
+    char file_esc[NM_MAX_NAME * 2];
+    if (json_escape_string(file_esc, sizeof(file_esc), file_name) < 0) {
+        STATE_UNLOCK(ctx);
+        return send_error_response(p->fd, ERR_INTERNAL, "encoding error");
+    }
+    char extra[MAX_JSON];
+    int offset = 0;
+    if (json_append(extra, sizeof(extra), &offset, "\"file\":\"%s\",\"checkpoints\":[", file_esc) < 0) {
+        STATE_UNLOCK(ctx);
+        return send_error_response(p->fd, ERR_INTERNAL, "response too large");
+    }
+    for (size_t i = 0; i < file->checkpoint_count; ++i) {
+        struct checkpoint_entry *entry = &file->checkpoints[i];
+        char tag_esc[NM_MAX_NAME * 2];
+        char user_esc[NM_MAX_USER * 2];
+        char ts_buf[32];
+        if (json_escape_string(tag_esc, sizeof(tag_esc), entry->tag) < 0 ||
+            json_escape_string(user_esc, sizeof(user_esc), entry->user) < 0) {
+            STATE_UNLOCK(ctx);
+            return send_error_response(p->fd, ERR_INTERNAL, "encoding error");
+        }
+        if (snprintf(ts_buf, sizeof(ts_buf), "%ld", (long)entry->timestamp) < 0) {
+            STATE_UNLOCK(ctx);
+            return send_error_response(p->fd, ERR_INTERNAL, "timestamp error");
+        }
+        if (i > 0) {
+            if (json_append(extra, sizeof(extra), &offset, ",") < 0) {
+                STATE_UNLOCK(ctx);
+                return send_error_response(p->fd, ERR_INTERNAL, "response too large");
+            }
+        }
+        if (json_append(extra, sizeof(extra), &offset,
+                        "{\"tag\":\"%s\",\"user\":\"%s\",\"timestamp\":\"%s\"}",
+                        tag_esc, user_esc, ts_buf) < 0) {
+            STATE_UNLOCK(ctx);
+            return send_error_response(p->fd, ERR_INTERNAL, "response too large");
+        }
+    }
+    if (json_append(extra, sizeof(extra), &offset, "]") < 0) {
+        STATE_UNLOCK(ctx);
+        return send_error_response(p->fd, ERR_INTERNAL, "response too large");
+    }
+    STATE_UNLOCK(ctx);
+    log_request(ctx, "LISTCHECKPOINTS user=%s file=%s", p->user, file_name);
+    return send_ok(p->fd, extra);
+}
+
 static int handle_client_message(struct nm_context *ctx, struct peer *p, const char *json) {
     char type[64];
     if (json_get_string(json, "type", type, sizeof(type)) < 0) {
@@ -1855,6 +2232,18 @@ static int handle_client_message(struct nm_context *ctx, struct peer *p, const c
     }
     if (strcmp(type, "STREAM") == 0) {
         return handle_client_stream(ctx, p, json);
+    }
+    if (strcmp(type, "CHECKPOINT") == 0) {
+        return handle_client_checkpoint(ctx, p, json);
+    }
+    if (strcmp(type, "VIEWCHECKPOINT") == 0) {
+        return handle_client_viewcheckpoint(ctx, p, json);
+    }
+    if (strcmp(type, "REVERT") == 0) {
+        return handle_client_revert(ctx, p, json);
+    }
+    if (strcmp(type, "LISTCHECKPOINTS") == 0) {
+        return handle_client_listcheckpoints(ctx, p, json);
     }
     if (strcmp(type, "ADDACCESS") == 0) {
         return handle_client_addaccess(ctx, p, json);
@@ -2431,67 +2820,71 @@ int main(int argc, char **argv) {
     const char *port = argv[1];
     const char *state_path = (argc == 3) ? argv[2] : DEFAULT_STATE_PATH;
 
-    struct nm_context ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.listen_fd = -1;
-
-    nm_state_init(&ctx.state, state_path);
-    array_init(&ctx.tickets, sizeof(struct ticket_entry));
-    array_init(&ctx.active_users, sizeof(struct active_user));
-    array_init(&ctx.replication_queue, sizeof(struct replication_task));
-
-    if (init_context_locks(&ctx) < 0) {
-        fprintf(stderr, "Failed to initialize NM locks\n");
-        close_context(&ctx);
+    struct nm_context *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        perror("calloc");
         return 1;
     }
+    ctx->listen_fd = -1;
+    int exit_code = 0;
 
-    if (log_open(&ctx.log_general, LOG_GENERAL_PATH) < 0 ||
-        log_open(&ctx.log_requests, LOG_REQUESTS_PATH) < 0) {
+    nm_state_init(&ctx->state, state_path);
+    array_init(&ctx->tickets, sizeof(struct ticket_entry));
+    array_init(&ctx->active_users, sizeof(struct active_user));
+    array_init(&ctx->replication_queue, sizeof(struct replication_task));
+
+    if (init_context_locks(ctx) < 0) {
+        fprintf(stderr, "Failed to initialize NM locks\n");
+        exit_code = 1;
+        goto cleanup;
+    }
+
+    if (log_open(&ctx->log_general, LOG_GENERAL_PATH) < 0 ||
+        log_open(&ctx->log_requests, LOG_REQUESTS_PATH) < 0) {
         fprintf(stderr, "Failed to open log files\n");
-        close_context(&ctx);
-        return 1;
+        exit_code = 1;
+        goto cleanup;
     }
 
-    if (init_context_locks(&ctx) < 0) {
+    if (init_context_locks(ctx) < 0) {
         fprintf(stderr, "Failed to initialize NM locks\n");
-        close_context(&ctx);
-        return 1;
+        exit_code = 1;
+        goto cleanup;
     }
 
-    ctx.listen_fd = net_listen(port, 64);
-    if (ctx.listen_fd < 0) {
+    ctx->listen_fd = net_listen(port, 64);
+    if (ctx->listen_fd < 0) {
         perror("net_listen");
-        close_context(&ctx);
-        return 1;
+        exit_code = 1;
+        goto cleanup;
     }
 
     for (int i = 0; i < MAX_PEERS; ++i) {
-        if (peer_slot_setup(&ctx.peers[i]) < 0) {
+        if (peer_slot_setup(&ctx->peers[i]) < 0) {
             fprintf(stderr, "Failed to initialize peer slot\n");
-            close_context(&ctx);
-            return 1;
+            exit_code = 1;
+            goto cleanup;
         }
     }
-    ctx.shutting_down = 0;
-    ctx.prune_thread_running = 0;
-    log_event(&ctx, "Name server listening on %s", port);
+    ctx->shutting_down = 0;
+    ctx->prune_thread_running = 0;
+    log_event(ctx, "Name server listening on %s", port);
 
-    if (pthread_create(&ctx.prune_thread, NULL, ticket_prune_worker, &ctx) == 0) {
-        ctx.prune_thread_running = 1;
+    if (pthread_create(&ctx->prune_thread, NULL, ticket_prune_worker, ctx) == 0) {
+        ctx->prune_thread_running = 1;
     } else {
-        log_event(&ctx, "failed to start ticket prune thread");
+        log_event(ctx, "failed to start ticket prune thread");
     }
-    if (pthread_create(&ctx.replication_thread, NULL, replication_worker, &ctx) == 0) {
-        ctx.replication_thread_running = 1;
+    if (pthread_create(&ctx->replication_thread, NULL, replication_worker, ctx) == 0) {
+        ctx->replication_thread_running = 1;
     } else {
-        log_event(&ctx, "failed to start replication worker");
+        log_event(ctx, "failed to start replication worker");
     }
 
-    while (!ctx.shutting_down) {
+    while (!ctx->shutting_down) {
         struct sockaddr_storage addr;
         socklen_t addrlen = sizeof(addr);
-        int fd = accept(ctx.listen_fd, (struct sockaddr *)&addr, &addrlen);
+        int fd = accept(ctx->listen_fd, (struct sockaddr *)&addr, &addrlen);
         if (fd < 0) {
             if (errno == EINTR) {
                 continue;
@@ -2503,9 +2896,9 @@ int main(int argc, char **argv) {
             continue;
         }
         int slot_index = -1;
-        struct peer *slot = allocate_peer(&ctx, &slot_index);
+        struct peer *slot = allocate_peer(ctx, &slot_index);
         if (!slot) {
-            log_event(&ctx, "too many connections");
+            log_event(ctx, "too many connections");
             net_close(fd);
             continue;
         }
@@ -2516,22 +2909,25 @@ int main(int argc, char **argv) {
         slot->thread_active = 1;
         struct peer_thread_arg *arg = malloc(sizeof(*arg));
         if (!arg) {
-            log_event(&ctx, "failed to allocate peer thread arg");
-            peer_close(&ctx, slot);
-            peer_reset(&ctx, slot);
+            log_event(ctx, "failed to allocate peer thread arg");
+            peer_close(ctx, slot);
+            peer_reset(ctx, slot);
             continue;
         }
-        arg->ctx = &ctx;
+        arg->ctx = ctx;
         arg->index = slot_index;
         if (pthread_create(&slot->thread, NULL, peer_thread_main, arg) != 0) {
-            log_event(&ctx, "failed to start peer thread");
-            peer_close(&ctx, slot);
-            peer_reset(&ctx, slot);
+            log_event(ctx, "failed to start peer thread");
+            peer_close(ctx, slot);
+            peer_reset(ctx, slot);
             free(arg);
             continue;
         }
     }
-
-    close_context(&ctx);
-    return 0;
+cleanup:
+    if (ctx) {
+        close_context(ctx);
+        free(ctx);
+    }
+    return exit_code;
 }

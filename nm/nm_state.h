@@ -12,6 +12,7 @@
 #define NM_MAX_REQUESTS 1024
 #define NM_MAX_NAME 128
 #define NM_MAX_USER 64
+#define NM_MAX_CHECKPOINTS 128
 #define NM_FILE_BUCKETS 1024
 
 #define NM_PERM_READ 0x1
@@ -34,6 +35,12 @@ struct file_acl_entry {
     int perm;
 };
 
+struct checkpoint_entry {
+    char tag[NM_MAX_NAME];
+    char user[NM_MAX_USER];
+    time_t timestamp;
+};
+
 struct file_entry {
     char name[NM_MAX_NAME];
     char owner[NM_MAX_USER];
@@ -47,6 +54,8 @@ struct file_entry {
     char last_access_user[NM_MAX_USER];
     struct file_acl_entry acl[NM_MAX_ACL];
     size_t acl_count;
+    struct checkpoint_entry checkpoints[NM_MAX_CHECKPOINTS];
+    size_t checkpoint_count;
     int hash_next;
 };
 
@@ -129,5 +138,12 @@ struct user_entry *nm_get_user(struct nm_state *state, const char *user);
 
 int nm_cache_lookup(struct nm_state *state, const char *name, int *ss_index);
 void nm_cache_put(struct nm_state *state, const char *name, int ss_index);
+
+int nm_file_add_checkpoint(struct nm_state *state,
+                           const char *name,
+                           const char *tag,
+                           const char *user,
+                           time_t timestamp);
+const struct checkpoint_entry *nm_file_find_checkpoint(const struct file_entry *file, const char *tag);
 
 #endif /* NM_STATE_H */

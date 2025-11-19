@@ -76,11 +76,13 @@ int ss_state_init(struct ss_state *state, const char *storage_dir) {
     snprintf(state->files_dir, sizeof(state->files_dir), "%s/files", storage_dir);
     snprintf(state->meta_dir, sizeof(state->meta_dir), "%s/meta", storage_dir);
     snprintf(state->undo_dir, sizeof(state->undo_dir), "%s/undo", storage_dir);
+    snprintf(state->checkpoints_dir, sizeof(state->checkpoints_dir), "%s/checkpoints", storage_dir);
 
     if (ensure_dir(storage_dir) < 0 ||
         ensure_dir(state->files_dir) < 0 ||
         ensure_dir(state->meta_dir) < 0 ||
-        ensure_dir(state->undo_dir) < 0) {
+        ensure_dir(state->undo_dir) < 0 ||
+        ensure_dir(state->checkpoints_dir) < 0) {
         return -1;
     }
 

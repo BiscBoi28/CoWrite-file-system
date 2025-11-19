@@ -105,6 +105,27 @@ static int ss_fetch_remote_content(const char *host,
                                    const char *ticket,
                                    char **out_content);
 static int valid_filename(const char *name);
+static int ensure_checkpoint_dir(const struct ss_state *state,
+                                 const char *file_name,
+                                 char *out_dir,
+                                 size_t dir_sz);
+static int build_checkpoint_path(struct ss_state *state,
+                                 const char *file_name,
+                                 const char *tag,
+                                 char *path,
+                                 size_t path_sz);
+static int ss_create_checkpoint(struct ss_context *ctx,
+                                const char *file_name,
+                                const char *tag,
+                                const char *user);
+static int ss_read_checkpoint(struct ss_context *ctx,
+                              const char *file_name,
+                              const char *tag,
+                              char **content_out);
+static int ss_revert_checkpoint(struct ss_context *ctx,
+                                const char *file_name,
+                                const char *tag,
+                                const char *user);
 static void ticket_table_init(struct ticket_table *table);
 static void ticket_table_destroy(struct ticket_table *table);
 static int ticket_table_add(struct ticket_table *table,
@@ -1401,6 +1422,189 @@ static int handle_nm_ticket_command(struct ss_context *ctx, const char *json) {
     return send_ok(ctx->nm_fd, "\"op\":\"TICKET\"");
 }
 
+static int ensure_checkpoint_dir(const struct ss_state *state,
+                                 const char *file_name,
+                                 char *out_dir,
+                                 size_t dir_sz) {
+    if (!state || !file_name) {
+        errno = EINVAL;
+        return -1;
+    }
+    char dir[512];
+    if (snprintf(dir, sizeof(dir), "%s/%s", state->checkpoints_dir, file_name) >= (int)sizeof(dir)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (ensure_directory(dir) < 0) {
+        return -1;
+    }
+    if (out_dir) {
+        if (snprintf(out_dir, dir_sz, "%s", dir) >= (int)dir_sz) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int build_checkpoint_path(struct ss_state *state,
+                                 const char *file_name,
+                                 const char *tag,
+                                 char *path,
+                                 size_t path_sz) {
+    if (!state || !file_name || !tag || !path) {
+        errno = EINVAL;
+        return -1;
+    }
+    char dir[512];
+    if (ensure_checkpoint_dir(state, file_name, dir, sizeof(dir)) < 0) {
+        return -1;
+    }
+    if (snprintf(path, path_sz, "%s/%s", dir, tag) >= (int)path_sz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+static int ss_create_checkpoint(struct ss_context *ctx,
+                                const char *file_name,
+                                const char *tag,
+                                const char *user) {
+    if (!valid_filename(tag)) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct ss_file view;
+    if (snapshot_file(ctx, file_name, &view) < 0) {
+        return -1;
+    }
+    char *content = load_text(view.data_path, NULL);
+    if (!content) {
+        content = strdup("");
+        if (!content) {
+            errno = ENOMEM;
+            return -1;
+        }
+    }
+    char path[512];
+    if (build_checkpoint_path(&ctx->state, file_name, tag, path, sizeof(path)) < 0) {
+        free(content);
+        return -1;
+    }
+    if (store_text_atomic(path, content) < 0) {
+        free(content);
+        return -1;
+    }
+    free(content);
+    log_request(ctx, "CHECKPOINT user=%s file=%s tag=%s", user, file_name, tag);
+    return 0;
+}
+
+static int ss_read_checkpoint(struct ss_context *ctx,
+                              const char *file_name,
+                              const char *tag,
+                              char **content_out) {
+    if (!valid_filename(tag)) {
+        errno = EINVAL;
+        return -1;
+    }
+    char path[512];
+    if (build_checkpoint_path(&ctx->state, file_name, tag, path, sizeof(path)) < 0) {
+        return -1;
+    }
+    char *content = load_text(path, NULL);
+    if (!content) {
+        errno = ENOENT;
+        return -1;
+    }
+    *content_out = content;
+    return 0;
+}
+
+static int ss_revert_checkpoint(struct ss_context *ctx,
+                                const char *file_name,
+                                const char *tag,
+                                const char *user) {
+    if (!valid_filename(tag)) {
+        errno = EINVAL;
+        return -1;
+    }
+    char path[512];
+    if (build_checkpoint_path(&ctx->state, file_name, tag, path, sizeof(path)) < 0) {
+        return -1;
+    }
+    char *checkpoint = load_text(path, NULL);
+    if (!checkpoint) {
+        errno = ENOENT;
+        return -1;
+    }
+    struct ss_file view;
+    if (snapshot_file(ctx, file_name, &view) < 0) {
+        free(checkpoint);
+        return -1;
+    }
+    char *current = load_text(view.data_path, NULL);
+    if (!current) {
+        current = strdup("");
+        if (!current) {
+            free(checkpoint);
+            errno = ENOMEM;
+            return -1;
+        }
+    }
+    if (store_text_atomic(view.undo_path, current) < 0) {
+        free(current);
+        free(checkpoint);
+        return -1;
+    }
+    free(current);
+    if (store_text_atomic(view.data_path, checkpoint) < 0) {
+        free(checkpoint);
+        return -1;
+    }
+    size_t new_chars = strlen(checkpoint);
+    size_t new_words = count_words_in_text(checkpoint);
+    time_t now = time(NULL);
+    struct ss_file notify_copy;
+    int have_meta = 0;
+    if (pthread_rwlock_wrlock(&ctx->state_lock) == 0) {
+        size_t idx = 0;
+        struct ss_file *file = ss_state_find(&ctx->state, file_name, &idx);
+        if (file) {
+            file->char_count = new_chars;
+            file->word_count = new_words;
+            file->modified = now;
+            file->last_access = now;
+            snprintf(file->last_access_user, sizeof(file->last_access_user), "%s", user);
+            ss_state_save_meta(&ctx->state, file);
+            notify_copy = *file;
+            have_meta = 1;
+        }
+        pthread_rwlock_unlock(&ctx->state_lock);
+    }
+    if (!have_meta) {
+        free(checkpoint);
+        errno = ENOENT;
+        return -1;
+    }
+    notify_nm_file_update(ctx, &notify_copy);
+    log_request(ctx, "REVERT user=%s file=%s tag=%s", user, file_name, tag);
+    free(checkpoint);
+    return 0;
+}
+
+static int respond_checkpoint_error(struct ss_context *ctx, int err, const char *msg) {
+    error_code_t code = ERR_INTERNAL;
+    if (err == ENOENT) {
+        code = ERR_NOTFOUND;
+    } else if (err == EINVAL || err == ENAMETOOLONG) {
+        code = ERR_BADREQ;
+    }
+    const char *details = msg ? msg : error_code_message(code);
+    return send_error_response(ctx->nm_fd, code, details);
+}
+
 static int process_nm_command(struct ss_context *ctx) {
     char *json = NULL;
     if (net_recv_json(ctx->nm_fd, &json) < 0) {
@@ -1451,7 +1655,7 @@ static int process_nm_command(struct ss_context *ctx) {
         }
     } else if (strcmp(type, "NM_TICKET") == 0) {
         handle_nm_ticket_command(ctx, json);
-        } else if (strcmp(type, "NM_UNDO") == 0) {
+    } else if (strcmp(type, "NM_UNDO") == 0) {
         char file_name[SS_NAME_MAX];
         char user[SS_USER_MAX];
         if (json_get_string(json, "file", file_name, sizeof(file_name)) < 0 ||
@@ -1481,6 +1685,68 @@ static int process_nm_command(struct ss_context *ctx) {
                 }
                 free(text);
             }
+        }
+    } else if (strcmp(type, "NM_CHECKPOINT_CREATE") == 0) {
+        char file_name[SS_NAME_MAX];
+        char tag[SS_NAME_MAX];
+        char user[SS_USER_MAX];
+        if (json_get_string(json, "file", file_name, sizeof(file_name)) < 0 ||
+            json_get_string(json, "tag", tag, sizeof(tag)) < 0 ||
+            json_get_string(json, "user", user, sizeof(user)) < 0) {
+            send_error_response(ctx->nm_fd, ERR_BADREQ, "invalid checkpoint");
+        } else if (!valid_filename(tag)) {
+            send_error_response(ctx->nm_fd, ERR_BADREQ, "invalid tag");
+        } else if (ss_create_checkpoint(ctx, file_name, tag, user) < 0) {
+            respond_checkpoint_error(ctx, errno, "checkpoint create failed");
+        } else {
+            send_ok(ctx->nm_fd, "\"op\":\"CHECKPOINT\"");
+        }
+    } else if (strcmp(type, "NM_CHECKPOINT_VIEW") == 0) {
+        char file_name[SS_NAME_MAX];
+        char tag[SS_NAME_MAX];
+        char user[SS_USER_MAX];
+        if (json_get_string(json, "file", file_name, sizeof(file_name)) < 0 ||
+            json_get_string(json, "tag", tag, sizeof(tag)) < 0 ||
+            json_get_string(json, "user", user, sizeof(user)) < 0) {
+            send_error_response(ctx->nm_fd, ERR_BADREQ, "invalid checkpoint");
+        } else if (!valid_filename(tag)) {
+            send_error_response(ctx->nm_fd, ERR_BADREQ, "invalid tag");
+        } else {
+            char *content = NULL;
+            if (ss_read_checkpoint(ctx, file_name, tag, &content) < 0) {
+                respond_checkpoint_error(ctx, errno, "checkpoint missing");
+            } else {
+                char *escaped = json_escape_dup(content);
+                free(content);
+                if (!escaped) {
+                    send_error_response(ctx->nm_fd, ERR_INTERNAL, "encoding error");
+                } else {
+                    char extra[MAX_JSON];
+                    if (snprintf(extra, sizeof(extra), "\"content\":\"%s\"", escaped) >= (int)sizeof(extra)) {
+                        free(escaped);
+                        send_error_response(ctx->nm_fd, ERR_INTERNAL, "response too large");
+                    } else {
+                        free(escaped);
+                        log_request(ctx, "VIEWCHECKPOINT user=%s file=%s tag=%s", user, file_name, tag);
+                        send_ok(ctx->nm_fd, extra);
+                    }
+                }
+            }
+        }
+    } else if (strcmp(type, "NM_CHECKPOINT_REVERT") == 0) {
+        char file_name[SS_NAME_MAX];
+        char tag[SS_NAME_MAX];
+        char user[SS_USER_MAX];
+        if (json_get_string(json, "file", file_name, sizeof(file_name)) < 0 ||
+            json_get_string(json, "tag", tag, sizeof(tag)) < 0 ||
+            json_get_string(json, "user", user, sizeof(user)) < 0) {
+            send_error_response(ctx->nm_fd, ERR_BADREQ, "invalid checkpoint");
+        } else if (!valid_filename(tag)) {
+            send_error_response(ctx->nm_fd, ERR_BADREQ, "invalid tag");
+        } else if (ss_revert_checkpoint(ctx, file_name, tag, user) < 0) {
+            respond_checkpoint_error(ctx, errno, "checkpoint revert failed");
+        } else {
+            send_ok(ctx->nm_fd, "\"op\":\"REVERT\"");
         }
     } else if (strcmp(type, "NM_SYNC") == 0) {
         return handle_nm_sync(ctx, json);

@@ -219,6 +219,7 @@ int nm_add_file(struct nm_state *state,
     file->last_access = now;
     snprintf(file->last_access_user, sizeof(file->last_access_user), "%s", owner);
     file->acl_count = 0;
+    file->checkpoint_count = 0;
     file->hash_next = -1;
     state->file_count++;
     file_hash_insert(state, (int)(state->file_count - 1));
@@ -346,6 +347,51 @@ int nm_check_access(struct nm_state *state, const char *name, const char *user, 
     return 0;
 }
 
+static struct checkpoint_entry *file_find_checkpoint(struct file_entry *file, const char *tag) {
+    if (!file || !tag) {
+        return NULL;
+    }
+    for (size_t i = 0; i < file->checkpoint_count; ++i) {
+        if (strcmp(file->checkpoints[i].tag, tag) == 0) {
+            return &file->checkpoints[i];
+        }
+    }
+    return NULL;
+}
+
+const struct checkpoint_entry *nm_file_find_checkpoint(const struct file_entry *file, const char *tag) {
+    return (const struct checkpoint_entry *)file_find_checkpoint((struct file_entry *)file, tag);
+}
+
+int nm_file_add_checkpoint(struct nm_state *state,
+                           const char *name,
+                           const char *tag,
+                           const char *user,
+                           time_t timestamp) {
+    if (!state || !name || !tag || !user) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct file_entry *file = nm_find_file(state, name);
+    if (!file) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (file_find_checkpoint(file, tag)) {
+        errno = EEXIST;
+        return -1;
+    }
+    if (file->checkpoint_count >= NM_MAX_CHECKPOINTS) {
+        errno = ENOSPC;
+        return -1;
+    }
+    struct checkpoint_entry *entry = &file->checkpoints[file->checkpoint_count++];
+    snprintf(entry->tag, sizeof(entry->tag), "%s", tag);
+    snprintf(entry->user, sizeof(entry->user), "%s", user);
+    entry->timestamp = timestamp;
+    return 0;
+}
+
 static struct user_entry *find_user(struct nm_state *state, const char *user) {
     for (size_t i = 0; i < state->user_count; ++i) {
         if (strcmp(state->users[i].name, user) == 0) {
@@ -462,6 +508,15 @@ int nm_state_save(struct nm_state *state) {
                    (long)file->last_access,
                    file->last_access_user,
                    file->acl_count);
+        for (size_t k = 0; k < file->checkpoint_count; ++k) {
+            struct checkpoint_entry *ck = &file->checkpoints[k];
+            write_line(fp,
+                       "CHECKPOINT %s %s %s %ld",
+                       file->name,
+                       ck->tag,
+                       ck->user,
+                       (long)ck->timestamp);
+        }
         for (size_t j = 0; j < file->acl_count; ++j) {
             struct file_acl_entry *acl = &file->acl[j];
             write_line(fp, "ACL %s %d", acl->user, acl->perm);
@@ -579,6 +634,23 @@ int nm_state_load(struct nm_state *state) {
                 struct file_acl_entry *acl = &current_file->acl[current_file->acl_count++];
                 memset(acl, 0, sizeof(*acl));
                 sscanf(line + 4, "%63s %d", acl->user, &acl->perm);
+            }
+        } else if (strncmp(line, "CHECKPOINT ", 11) == 0) {
+            char ck_file[NM_MAX_NAME];
+            char ck_tag[NM_MAX_NAME];
+            char ck_user[NM_MAX_USER];
+            long ck_ts = 0;
+            if (sscanf(line + 11, "%127s %127s %63s %ld",
+                       ck_file, ck_tag, ck_user, &ck_ts) == 4) {
+                struct file_entry *file = nm_find_file(state, ck_file);
+                if (file && file->checkpoint_count < NM_MAX_CHECKPOINTS) {
+                    struct checkpoint_entry *entry = &file->checkpoints[file->checkpoint_count++];
+                    strncpy(entry->tag, ck_tag, sizeof(entry->tag) - 1);
+                    entry->tag[sizeof(entry->tag) - 1] = '\0';
+                    strncpy(entry->user, ck_user, sizeof(entry->user) - 1);
+                    entry->user[sizeof(entry->user) - 1] = '\0';
+                    entry->timestamp = (time_t)ck_ts;
+                }
             }
         } else if (strncmp(line, "REQ ", 4) == 0) {
             if (state->request_count < NM_MAX_REQUESTS) {

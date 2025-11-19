@@ -31,6 +31,7 @@ struct ss_state {
     char files_dir[256];
     char meta_dir[256];
     char undo_dir[256];
+    char checkpoints_dir[256];
     struct array files; /* struct ss_file */
 };
 

@@ -45,6 +45,24 @@ static char *trim_spaces(char *s) {
     return s;
 }
 
+static int valid_checkpoint_tag(const char *tag) {
+    if (!tag || !tag[0]) {
+        return 0;
+    }
+    for (const unsigned char *p = (const unsigned char *)tag; *p; ++p) {
+        if (*p == '.' && (p == (const unsigned char *)tag || *(p + 1) == '.')) {
+            return 0;
+        }
+        if (*p == '/' || *p == '\\') {
+            return 0;
+        }
+        if (*p < 32 || *p > 126) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int socket_local_ip(int fd, char *buf, size_t buf_size) {
     struct sockaddr_storage addr;
     socklen_t len = sizeof(addr);
@@ -203,7 +221,7 @@ static void format_timestamp(int raw_value, char *buf, size_t buf_len) {
     struct tm *tm_tmp = gmtime(&ts);
     struct tm *tm_info = tm_tmp ? memcpy(&tm_buf, tm_tmp, sizeof(struct tm)) : NULL;
 #endif
-    if (!tm_info || strftime(buf, buf_len, "%d-%m-%y %H-%M-%S", tm_info) == 0) {
+    if (!tm_info || strftime(buf, buf_len, "%d-%m-%Y %H:%M:%S", tm_info) == 0) {
         snprintf(buf, buf_len, "unknown");
     }
 }
@@ -1198,6 +1216,169 @@ static int handle_exec_cmd(int nm_fd, const char *file) {
     return 0;
 }
 
+static void print_checkpoint_list(const char *file, const char *response) {
+    const char *marker = strstr(response, "\"checkpoints\":");
+    if (!marker) {
+        printf("No checkpoints for %s.\n", file);
+        return;
+    }
+    const char *array_start = strchr(marker, '[');
+    if (!array_start) {
+        printf("No checkpoints for %s.\n", file);
+        return;
+    }
+    const char *p = array_start + 1;
+    int printed = 0;
+    while (*p && *p != ']') {
+        while (*p && (isspace((unsigned char)*p) || *p == ',')) {
+            p++;
+        }
+        if (!*p || *p != '{') {
+            break;
+        }
+        const char *obj_end = strchr(p, '}');
+        if (!obj_end) {
+            break;
+        }
+        size_t len = (size_t)(obj_end - p + 1);
+        char *obj = malloc(len + 1);
+        if (!obj) {
+            break;
+        }
+        memcpy(obj, p, len);
+        obj[len] = '\0';
+        char tag[128] = "";
+        char user[128] = "";
+        char timestamp[32] = "";
+        json_get_string(obj, "tag", tag, sizeof(tag));
+        json_get_string(obj, "user", user, sizeof(user));
+        json_get_string(obj, "timestamp", timestamp, sizeof(timestamp));
+        char ts_buf[32];
+        long ts_val = timestamp[0] ? strtol(timestamp, NULL, 10) : 0;
+        format_timestamp((int)ts_val, ts_buf, sizeof(ts_buf));
+        if (!printed) {
+            printf("Checkpoints for %s:\n", file);
+        }
+        printf("  %-24s %-16s %s\n",
+               tag[0] ? tag : "(unknown)",
+               user[0] ? user : "(unknown)",
+               ts_buf);
+        printed++;
+        free(obj);
+        p = obj_end + 1;
+    }
+    if (!printed) {
+        printf("No checkpoints for %s.\n", file);
+    }
+}
+
+static int handle_checkpoint_cmd(int nm_fd, const char *file, const char *tag) {
+    char file_esc[256];
+    char tag_esc[256];
+    if (json_escape_string(file_esc, sizeof(file_esc), file) < 0 ||
+        json_escape_string(tag_esc, sizeof(tag_esc), tag) < 0) {
+        fprintf(stderr, "Encoding error\n");
+        return -1;
+    }
+    char *response = NULL;
+    if (nm_call(nm_fd, &response, "CHECKPOINT", "\"file\":\"%s\",\"tag\":\"%s\"", file_esc, tag_esc) < 0) {
+        fprintf(stderr, "Failed to contact NM\n");
+        return -1;
+    }
+    char status[16];
+    if (parse_status(response, status, sizeof(status), NULL, 0) < 0 || strcmp(status, "OK") != 0) {
+        print_error_response(response);
+        free(response);
+        return -1;
+    }
+    printf("Checkpoint '%s' saved for %s.\n", tag, file);
+    free(response);
+    return 0;
+}
+
+static int handle_viewcheckpoint_cmd(int nm_fd, const char *file, const char *tag) {
+    char file_esc[256];
+    char tag_esc[256];
+    char user_esc[256];
+    if (json_escape_string(file_esc, sizeof(file_esc), file) < 0 ||
+        json_escape_string(tag_esc, sizeof(tag_esc), tag) < 0 ||
+        json_escape_string(user_esc, sizeof(user_esc), g_username) < 0) {
+        fprintf(stderr, "Encoding error\n");
+        return -1;
+    }
+    char *response = NULL;
+    if (nm_call(nm_fd, &response, "VIEWCHECKPOINT", "\"file\":\"%s\",\"tag\":\"%s\",\"user\":\"%s\"",
+                file_esc, tag_esc, user_esc) < 0) {
+        fprintf(stderr, "Failed to contact NM\n");
+        return -1;
+    }
+    char status[16];
+    if (parse_status(response, status, sizeof(status), NULL, 0) < 0 || strcmp(status, "OK") != 0) {
+        print_error_response(response);
+        free(response);
+        return -1;
+    }
+    char *content = NULL;
+    if (json_get_string_alloc(response, "content", &content) < 0) {
+        fprintf(stderr, "Missing checkpoint content\n");
+        free(response);
+        return -1;
+    }
+    free(response);
+    printf("--- checkpoint %s/%s ---\n%s\n-----------------------\n", file, tag, content);
+    free(content);
+    return 0;
+}
+
+static int handle_revert_cmd(int nm_fd, const char *file, const char *tag) {
+    char file_esc[256];
+    char tag_esc[256];
+    char user_esc[256];
+    if (json_escape_string(file_esc, sizeof(file_esc), file) < 0 ||
+        json_escape_string(tag_esc, sizeof(tag_esc), tag) < 0 ||
+        json_escape_string(user_esc, sizeof(user_esc), g_username) < 0) {
+        fprintf(stderr, "Encoding error\n");
+        return -1;
+    }
+    char *response = NULL;
+    if (nm_call(nm_fd, &response, "REVERT", "\"file\":\"%s\",\"tag\":\"%s\",\"user\":\"%s\"",
+                file_esc, tag_esc, user_esc) < 0) {
+        fprintf(stderr, "Failed to contact NM\n");
+        return -1;
+    }
+    char status[16];
+    if (parse_status(response, status, sizeof(status), NULL, 0) < 0 || strcmp(status, "OK") != 0) {
+        print_error_response(response);
+        free(response);
+        return -1;
+    }
+    printf("Reverted %s to checkpoint '%s'.\n", file, tag);
+    free(response);
+    return 0;
+}
+
+static int handle_listcheckpoints_cmd(int nm_fd, const char *file) {
+    char file_esc[256];
+    if (json_escape_string(file_esc, sizeof(file_esc), file) < 0) {
+        fprintf(stderr, "Encoding error\n");
+        return -1;
+    }
+    char *response = NULL;
+    if (nm_call(nm_fd, &response, "LISTCHECKPOINTS", "\"file\":\"%s\"", file_esc) < 0) {
+        fprintf(stderr, "Failed to contact NM\n");
+        return -1;
+    }
+    char status[16];
+    if (parse_status(response, status, sizeof(status), NULL, 0) < 0 || strcmp(status, "OK") != 0) {
+        print_error_response(response);
+        free(response);
+        return -1;
+    }
+    print_checkpoint_list(file, response);
+    free(response);
+    return 0;
+}
+
 static int handle_exit_cmd(int nm_fd) {
     char *response = NULL;
     if (nm_call(nm_fd, &response, "CLIENT_EXIT", NULL) < 0) {
@@ -1225,6 +1406,10 @@ static void print_help(void) {
     printf("  WRITE <file> [sentence]\n");
     printf("    After WRITE, enter '<word_index> <content>' lines and finish with ETIRW.\n");
     printf("  STREAM <file>\n");
+    printf("  CHECKPOINT <file> <tag>\n");
+    printf("  VIEWCHECKPOINT <file> <tag>\n");
+    printf("  REVERT <file> <tag>\n");
+    printf("  LISTCHECKPOINTS <file>\n");
     printf("  ADDACCESS -R|-W <file> <user>\n");
     printf("    legacy: ADDACCESS <file> <user> [rw]\n");
     printf("  REMACCESS <file> <user>\n");
@@ -1412,6 +1597,68 @@ int main(int argc, char **argv) {
             }
             while (*file && isspace((unsigned char)*file)) file++;
             handle_stream_cmd(nm_fd, file);
+            continue;
+        }
+        if (strcmp(cmd, "CHECKPOINT") == 0) {
+            char *file = strtok_r(NULL, " ", &save);
+            char *tag = strtok_r(NULL, " ", &save);
+            if (!file || !tag) {
+                printf("usage: CHECKPOINT <file> <tag>\n");
+                continue;
+            }
+            file = trim_spaces(file);
+            tag = trim_spaces(tag);
+            if (!file || !*file || !tag || !*tag || !valid_checkpoint_tag(tag)) {
+                printf("usage: CHECKPOINT <file> <tag>\n");
+                continue;
+            }
+            handle_checkpoint_cmd(nm_fd, file, tag);
+            continue;
+        }
+        if (strcmp(cmd, "VIEWCHECKPOINT") == 0) {
+            char *file = strtok_r(NULL, " ", &save);
+            char *tag = strtok_r(NULL, " ", &save);
+            if (!file || !tag) {
+                printf("usage: VIEWCHECKPOINT <file> <tag>\n");
+                continue;
+            }
+            file = trim_spaces(file);
+            tag = trim_spaces(tag);
+            if (!file || !*file || !tag || !*tag || !valid_checkpoint_tag(tag)) {
+                printf("usage: VIEWCHECKPOINT <file> <tag>\n");
+                continue;
+            }
+            handle_viewcheckpoint_cmd(nm_fd, file, tag);
+            continue;
+        }
+        if (strcmp(cmd, "REVERT") == 0) {
+            char *file = strtok_r(NULL, " ", &save);
+            char *tag = strtok_r(NULL, " ", &save);
+            if (!file || !tag) {
+                printf("usage: REVERT <file> <tag>\n");
+                continue;
+            }
+            file = trim_spaces(file);
+            tag = trim_spaces(tag);
+            if (!file || !*file || !tag || !*tag || !valid_checkpoint_tag(tag)) {
+                printf("usage: REVERT <file> <tag>\n");
+                continue;
+            }
+            handle_revert_cmd(nm_fd, file, tag);
+            continue;
+        }
+        if (strcmp(cmd, "LISTCHECKPOINTS") == 0) {
+            char *file = strtok_r(NULL, "", &save);
+            if (!file) {
+                printf("usage: LISTCHECKPOINTS <file>\n");
+                continue;
+            }
+            file = trim_spaces(file);
+            if (!file || !*file) {
+                printf("usage: LISTCHECKPOINTS <file>\n");
+                continue;
+            }
+            handle_listcheckpoints_cmd(nm_fd, file);
             continue;
         }
         if (strcmp(cmd, "WRITE") == 0) {
